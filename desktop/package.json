@@ -9,7 +9,9 @@
     "build:vite": "vite build",
     "build:electron": "node scripts/copy-main.js",
     "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "dist": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder",
+    "dist:linux": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --linux AppImage",
+    "dist:win": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
     "dist:portable": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win portable",
     "start": "electron ."
   },
@@ -59,9 +61,16 @@
       ],
       "signAndEditExecutable": false
     },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     }
-  }
+  },
+  "homepage": "https://github.com/demi-power/resume-generator"
 }

@@ -4,8 +4,8 @@ import Database from "better-sqlite3";
 import type { ResumeData } from "./resume-store";
 import { normalizeCompanyForDuplicateKey } from "./normalize-company";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_PATH = path.join(DATA_DIR, "app.db");
+export const DATA_DIR = path.join(process.cwd(), "data");
+export const DB_PATH = path.join(DATA_DIR, "app.db");
 
 function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) {
@@ -16,6 +16,7 @@ function ensureDataDir(): void {
 ensureDataDir();
 
 const db = new Database(DB_PATH);
+export const rawDb = db;
 db.pragma("journal_mode = WAL");
 
 db.exec(`
