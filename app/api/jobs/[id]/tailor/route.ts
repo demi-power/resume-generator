@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import type { GenerationProviderId } from "@/lib/unified/types";
-import { createTailorTask } from "@/lib/unified/store";
+import { createTailorTask, getJobStatus } from "@/lib/unified/store";
 import { requireUnifiedOwner } from "@/lib/unified/route-helpers";
 
 export const runtime = "nodejs";
@@ -14,5 +14,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "matchResultId is required" }, { status: 400 });
   }
   const provider = body.provider ?? "local_ollama";
-  return NextResponse.json(await createTailorTask({ jobId: id, matchResultId: body.matchResultId, provider, requestedBy: user.id }));
+  const task = await createTailorTask({ jobId: id, matchResultId: body.matchResultId, provider, requestedBy: user.id });
+  const status = provider === "deepseek_webview" ? 200 : 202;
+  return NextResponse.json({ job: getJobStatus(id), task, queued: provider !== "deepseek_webview" }, { status });
 }

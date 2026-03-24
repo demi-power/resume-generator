@@ -71,6 +71,7 @@ export function AppHeader() {
     { path: "/profile", label: "Profile", icon: <User className="h-4 w-4" /> },
     { path: "/template/format1", label: "Templates", icon: <FileText className="h-4 w-4" />, adminOnly: true },
     { path: "/ai", label: "AI", icon: <Sparkles className="h-4 w-4" />, adminOnly: true },
+    { path: "/pipeline", label: "Pipeline", icon: <FolderOpen className="h-4 w-4" />, adminOnly: true },
     { path: "/applications", label: "Application", icon: <Briefcase className="h-4 w-4" /> },
     { path: "/users", label: "Users", icon: <Users className="h-4 w-4" />, adminOnly: true },
   ];

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireUnifiedOwner } from "@/lib/unified/route-helpers";
-import { runRankingForJob } from "@/lib/unified/store";
+import { enqueueJobRanking, getJobStatus } from "@/lib/unified/store";
 
 export const runtime = "nodejs";
 
@@ -8,5 +8,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const user = requireUnifiedOwner(request);
   if (user instanceof NextResponse) return user;
   const { id } = await params;
-  return NextResponse.json(await runRankingForJob(id));
+  const task = enqueueJobRanking(id, user.id);
+  return NextResponse.json({ job: getJobStatus(id), task, queued: true }, { status: 202 });
 }

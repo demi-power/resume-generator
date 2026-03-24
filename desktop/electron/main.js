@@ -3,6 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const { execFile } = require("child_process");
+const crypto = require("crypto");
 
 const DIST_DIR = path.join(__dirname, "..", "dist");
 const PRELOAD_PATH = path.join(__dirname, "preload.js");
@@ -439,6 +440,87 @@ ipcMain.handle("show-save-path-dialog", async (event) => {
   });
   if (canceled || !filePaths || filePaths.length === 0) return null;
   return filePaths[0] || null;
+});
+
+function isInsideRoot(rootPath, targetPath) {
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedTarget = path.resolve(targetPath);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+}
+
+function scanResumeSyncFolder(rootPath) {
+  const resolvedRoot = path.resolve(String(rootPath || ""));
+  if (!resolvedRoot || !fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) {
+    throw new Error("Resume sync folder not found");
+  }
+
+  const files = [];
+  const errors = [];
+
+  const walk = (currentDir) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (err) {
+      errors.push(currentDir + ": " + (err && err.message ? err.message : String(err)));
+      return;
+    }
+
+    for (const entry of entries) {
+      const absolutePath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolutePath);
+        continue;
+      }
+      if (entry.isFile() === false || /\.html?$/i.test(entry.name) === false) continue;
+      try {
+        const buffer = fs.readFileSync(absolutePath);
+        const stat = fs.statSync(absolutePath);
+        const relativePath = path.relative(resolvedRoot, absolutePath).split(path.sep).join("/");
+        files.push({
+          relativePath,
+          contentHash: crypto.createHash("sha256").update(buffer).digest("hex"),
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+        });
+      } catch (err) {
+        errors.push(absolutePath + ": " + (err && err.message ? err.message : String(err)));
+      }
+    }
+  };
+
+  walk(resolvedRoot);
+  files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return { rootPath: resolvedRoot, files, errors };
+}
+
+ipcMain.handle("show-resume-sync-folder-dialog", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const { canceled, filePaths } = await dialog.showOpenDialog(win || null, {
+    properties: ["openDirectory"],
+    title: "Choose folder containing HTML resumes",
+  });
+  if (canceled || !filePaths || filePaths.length === 0) return null;
+  return filePaths[0] || null;
+});
+
+ipcMain.handle("scan-resume-sync-folder", async (_event, rootPath) => scanResumeSyncFolder(rootPath));
+
+ipcMain.handle("read-resume-sync-file", async (_event, payload) => {
+  const rootPath = payload && typeof payload.rootPath === "string" ? payload.rootPath : "";
+  const relativePath = payload && typeof payload.relativePath === "string" ? payload.relativePath.replace(/\\/g, "/") : "";
+  const segments = relativePath.split("/").filter(Boolean);
+  if (!rootPath || !relativePath || segments.includes("..")) {
+    throw new Error("Invalid resume sync file path");
+  }
+  const absolutePath = path.resolve(rootPath, ...segments);
+  if (!isInsideRoot(rootPath, absolutePath)) {
+    throw new Error("Resume sync file must stay inside the selected folder");
+  }
+  return {
+    relativePath,
+    html: fs.readFileSync(absolutePath, "utf8"),
+  };
 });
 
 // Cross-platform: never mkdir a filesystem/drive root (Windows E:\, Unix /).

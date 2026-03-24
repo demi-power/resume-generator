@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createJobsFromUrls } from "@/lib/unified/store";
+import { createJobsFromUrls, enqueueJobExtraction } from "@/lib/unified/store";
 import { requireUnifiedOwner } from "@/lib/unified/route-helpers";
 
 export const runtime = "nodejs";
@@ -19,5 +19,9 @@ export async function POST(request: Request) {
       ? { url: entry, batchId: body.batchId ?? null }
       : { url: entry.url, titleHint: entry.titleHint ?? null, companyHint: entry.companyHint ?? null, batchId: entry.batchId ?? body.batchId ?? null }
   );
-  return NextResponse.json({ items: createJobsFromUrls({ submittedBy: user.id, sourceType: "url", urls }) });
+  const items = createJobsFromUrls({ submittedBy: user.id, sourceType: "url", urls });
+  const tasks = items
+    .map((item) => enqueueJobExtraction(String(item.id), user.id))
+    .filter(Boolean);
+  return NextResponse.json({ items, tasks, queued: tasks.length });
 }

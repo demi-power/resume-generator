@@ -16,6 +16,7 @@ import type {
   VerifierResult,
 } from "@/lib/unified/types";
 import { canonicalizeJobUrl, createId, nowIso, safeJsonParse, sanitizeRelativePath } from "@/lib/unified/utils";
+import { enqueueUnifiedTask, listUnifiedTasks } from "@/lib/unified/queue";
 
 rawDb.exec(`
 CREATE TABLE IF NOT EXISTS resume_sync_runs (
@@ -282,7 +283,6 @@ function persistImportedSnapshot(variant: VariantRow, sourceHash: string, docume
 }
 
 function persistTailoredSnapshot(params: {
-  taskId: string;
   baseSnapshot: SnapshotRow;
   jobId: string;
   jobProfile: JobProfile;
@@ -331,12 +331,6 @@ function persistTailoredSnapshot(params: {
   insertArtifact("resume_snapshot", snapshotId, "job_json", jobArtifact.relativePath, "application/json", jobArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "match_json", matchArtifact.relativePath, "application/json", matchArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "verify_json", verifyArtifact.relativePath, "application/json", verifyArtifact.sizeBytes);
-  try {
-    const pdfBuffer = rawDb ? undefined : undefined;
-    void pdfBuffer;
-  } catch {
-    // unreachable placeholder for TS narrowing
-  }
   return snapshotId;
 }
 
@@ -478,6 +472,21 @@ export function commitResumeSyncRun(syncRunId: string): Record<string, unknown> 
   return getResumeSyncRun(syncRunId)!;
 }
 
+export function enqueueJobExtraction(jobId: string, requestedBy?: string | null): Record<string, unknown> | null {
+  const job = getJob(jobId);
+  if (!job) throw new Error("Job not found");
+  const status = String(job.status || "queued") as JobStatus;
+  if (["extracted", "ranked", "completed"].includes(status)) return null;
+  return enqueueUnifiedTask({ taskType: "job_extract", requestedBy: requestedBy ?? null, jobId, payload: { jobId } }) as unknown as Record<string, unknown>;
+}
+
+export function enqueueJobRanking(jobId: string, requestedBy?: string | null): Record<string, unknown> {
+  const job = getJob(jobId);
+  if (!job) throw new Error("Job not found");
+  rawDb.prepare("UPDATE jobs SET processing_stage = 'ranking', updated_at = ? WHERE id = ?").run(nowIso(), jobId);
+  return enqueueUnifiedTask({ taskType: "job_rank", requestedBy: requestedBy ?? null, jobId, payload: { jobId }, priority: 200 }) as unknown as Record<string, unknown>;
+}
+
 export function createJobsFromUrls(params: {
   submittedBy?: string | null;
   sourceType: "url" | "csv";
@@ -520,7 +529,9 @@ export function getJobStatus(jobId: string): Record<string, unknown> | undefined
   const fetchAttempts = rawDb.prepare("SELECT * FROM job_fetch_attempts WHERE job_id = ? ORDER BY created_at ASC").all(jobId);
   const latestMatchRun = getLatestMatchRun(jobId);
   const latestTailorTask = rawDb.prepare("SELECT * FROM tailor_tasks WHERE job_id = ? ORDER BY created_at DESC LIMIT 1").get(jobId) as Record<string, unknown> | undefined;
-  return { ...job, fetchAttempts, latestMatchRun, latestTailorTask };
+  const matchResults = listMatchResults(jobId);
+  const unifiedTasks = listUnifiedTasks({ jobId, limit: 20 }) as unknown as Array<Record<string, unknown>>;
+  return { ...job, fetchAttempts, latestMatchRun, latestTailorTask, matchResults, unifiedTasks };
 }
 
 export async function ensureJobExtracted(jobId: string): Promise<Record<string, unknown>> {
@@ -658,9 +669,35 @@ export async function createTailorTask(params: {
   if (!matchRow) throw new Error("Match result not found");
   const baseSnapshot = getSnapshot(String(matchRow.resume_snapshot_id));
   if (!baseSnapshot) throw new Error("Base snapshot not found");
-  const job = await ensureJobExtracted(params.jobId);
-  const jobProfile = safeJsonParse(job.job_profile_json as string, {} as JobProfile);
   const taskId = createId();
+  const initialStatus: TailorTaskStatus = params.provider === "deepseek_webview" ? "awaiting_claim" : "queued";
+  rawDb.prepare(
+    "INSERT INTO tailor_tasks (id, job_id, match_run_id, match_result_id, base_snapshot_id, provider, status, retries, max_retries, requested_by, claimed_by, gpt_chat_url, resume_patch_json, verifier_result_id, tailored_snapshot_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 2, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)"
+  ).run(taskId, params.jobId, String(matchRow.match_run_id), params.matchResultId, baseSnapshot.id, params.provider, initialStatus, params.requestedBy ?? null, nowIso(), nowIso());
+  rawDb.prepare("UPDATE jobs SET status = 'tailoring', processing_stage = 'tailoring', updated_at = ? WHERE id = ?").run(nowIso(), params.jobId);
+  if (params.provider !== "deepseek_webview") {
+    enqueueUnifiedTask({
+      taskType: "tailor_local",
+      requestedBy: params.requestedBy ?? null,
+      jobId: params.jobId,
+      tailorTaskId: taskId,
+      payload: { taskId, provider: params.provider },
+      priority: 300,
+    });
+  }
+  return rawDb.prepare("SELECT * FROM tailor_tasks WHERE id = ?").get(taskId) as Record<string, unknown>;
+}
+
+export async function runLocalTailorTask(taskId: string, _payload?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const task = rawDb.prepare("SELECT * FROM tailor_tasks WHERE id = ?").get(taskId) as Record<string, unknown> | undefined;
+  if (!task) throw new Error("Tailor task not found");
+  if (String(task.provider) !== "local_ollama") throw new Error("Tailor task is not a local generator task");
+  const baseSnapshot = getSnapshot(String(task.base_snapshot_id));
+  if (!baseSnapshot) throw new Error("Base snapshot not found");
+  const job = await ensureJobExtracted(String(task.job_id));
+  const jobProfile = safeJsonParse(job.job_profile_json as string, {} as JobProfile);
+  const matchRow = rawDb.prepare("SELECT * FROM match_results WHERE id = ?").get(task.match_result_id) as Record<string, unknown> | undefined;
+  if (!matchRow) throw new Error("Match result not found");
   const match = {
     resumeSnapshotId: String(matchRow.resume_snapshot_id),
     resumeVariantId: String(matchRow.resume_variant_id),
@@ -676,31 +713,30 @@ export async function createTailorTask(params: {
     missingRequirements: safeJsonParse(matchRow.missing_requirements_json as string, [] as string[]),
     supportingChunkIds: safeJsonParse(matchRow.supporting_chunk_ids_json as string, [] as string[]),
   } satisfies RankedResumeCandidate;
-  const initialStatus: TailorTaskStatus = params.provider === "deepseek_webview" ? "awaiting_claim" : "verifying";
-  rawDb.prepare(
-    "INSERT INTO tailor_tasks (id, job_id, match_run_id, match_result_id, base_snapshot_id, provider, status, retries, max_retries, requested_by, claimed_by, gpt_chat_url, resume_patch_json, verifier_result_id, tailored_snapshot_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 2, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)"
-  ).run(taskId, params.jobId, String(matchRow.match_run_id), params.matchResultId, baseSnapshot.id, params.provider, initialStatus, params.requestedBy ?? null, nowIso(), nowIso());
-  if (params.provider === "deepseek_webview") {
-    rawDb.prepare("UPDATE jobs SET status = 'tailoring', processing_stage = 'tailoring', updated_at = ? WHERE id = ?").run(nowIso(), params.jobId);
-    return rawDb.prepare("SELECT * FROM tailor_tasks WHERE id = ?").get(taskId) as Record<string, unknown>;
-  }
+  rawDb.prepare("UPDATE tailor_tasks SET status = 'verifying', updated_at = ? WHERE id = ?").run(nowIso(), taskId);
   const baseDocument = loadImportedDocument(baseSnapshot);
-  const patch = generateTailoredPatch(baseDocument, jobProfile, match, params.provider);
+  const patch = generateTailoredPatch(baseDocument, jobProfile, match, "local_ollama");
   const verifier = verifyTailoredPatch(baseDocument, patch, jobProfile);
   const verifierId = createVerifierRecord(taskId, verifier);
+  let status: TailorTaskStatus = verifier.pass ? "completed" : "manual_review_required";
   let tailoredSnapshotId: string | null = null;
-  let finalStatus: TailorTaskStatus = verifier.pass ? "completed" : "manual_review_required";
-  rawDb.prepare("UPDATE tailor_tasks SET status = ?, resume_patch_json = ?, verifier_result_id = ?, updated_at = ? WHERE id = ?").run(finalStatus, JSON.stringify(patch), verifierId, nowIso(), taskId);
+  rawDb.prepare("UPDATE tailor_tasks SET status = ?, resume_patch_json = ?, verifier_result_id = ?, retries = retries + 1, updated_at = ? WHERE id = ?").run(
+    status,
+    JSON.stringify(patch),
+    verifierId,
+    nowIso(),
+    taskId
+  );
   if (verifier.pass) {
-    tailoredSnapshotId = persistTailoredSnapshot({ taskId, baseSnapshot, jobId: params.jobId, jobProfile, match, patch, verifier });
+    tailoredSnapshotId = persistTailoredSnapshot({ baseSnapshot, jobId: String(task.job_id), jobProfile, match, patch, verifier });
     const htmlArtifact = rawDb.prepare("SELECT relative_path FROM artifact_records WHERE owner_type = 'resume_snapshot' AND owner_id = ? AND artifact_kind = 'resume_html' ORDER BY created_at DESC LIMIT 1").get(tailoredSnapshotId) as { relative_path: string } | undefined;
     if (htmlArtifact?.relative_path) {
-      await persistTailoredPdf(tailoredSnapshotId, params.jobId, readUnifiedArtifactText(htmlArtifact.relative_path));
+      await persistTailoredPdf(tailoredSnapshotId, String(task.job_id), readUnifiedArtifactText(htmlArtifact.relative_path));
     }
     rawDb.prepare("UPDATE tailor_tasks SET tailored_snapshot_id = ?, updated_at = ? WHERE id = ?").run(tailoredSnapshotId, nowIso(), taskId);
-    rawDb.prepare("UPDATE jobs SET status = 'completed', processing_stage = 'completed', updated_at = ? WHERE id = ?").run(nowIso(), params.jobId);
+    rawDb.prepare("UPDATE jobs SET status = 'completed', processing_stage = 'completed', updated_at = ? WHERE id = ?").run(nowIso(), String(task.job_id));
   } else {
-    rawDb.prepare("UPDATE jobs SET status = 'manual_review_required', processing_stage = 'tailoring', updated_at = ? WHERE id = ?").run(nowIso(), params.jobId);
+    rawDb.prepare("UPDATE jobs SET status = 'manual_review_required', processing_stage = 'tailoring', updated_at = ? WHERE id = ?").run(nowIso(), String(task.job_id));
   }
   return rawDb.prepare("SELECT * FROM tailor_tasks WHERE id = ?").get(taskId) as Record<string, unknown>;
 }
@@ -753,7 +789,7 @@ export async function submitDeepseekTailorTask(params: {
     params.taskId
   );
   if (verifier.pass) {
-    tailoredSnapshotId = persistTailoredSnapshot({ taskId: params.taskId, baseSnapshot, jobId: String(task.job_id), jobProfile, match, patch: params.patch, verifier });
+    tailoredSnapshotId = persistTailoredSnapshot({ baseSnapshot, jobId: String(task.job_id), jobProfile, match, patch: params.patch, verifier });
     const htmlArtifact = rawDb.prepare("SELECT relative_path FROM artifact_records WHERE owner_type = 'resume_snapshot' AND owner_id = ? AND artifact_kind = 'resume_html' ORDER BY created_at DESC LIMIT 1").get(tailoredSnapshotId) as { relative_path: string } | undefined;
     if (htmlArtifact?.relative_path) {
       await persistTailoredPdf(tailoredSnapshotId, String(task.job_id), readUnifiedArtifactText(htmlArtifact.relative_path));

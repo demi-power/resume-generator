@@ -13,6 +13,7 @@ import { TemplatePage } from "./pages/TemplatePage";
 import { AuthPage } from "./pages/AuthPage";
 import { NoPermissionPage } from "./pages/NoPermissionPage";
 import { UsersPage } from "./pages/UsersPage";
+import { PipelinePage } from "./pages/PipelinePage";
 
 /** Redirect empty path or /index.html to "/" so job applications always show on start. */
 function EnsureJobApplicationsDefault() {
@@ -38,6 +39,7 @@ function AppShell() {
             <Routes>
               <Route path="/profile" element={<ProfilePage />} />
               <Route path="/ai" element={<AIPage />} />
+              <Route path="/pipeline" element={<PipelinePage />} />
               <Route path="/template/:formatId" element={<TemplatePage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/" element={<JobApplicationsView />} />
