@@ -1,5 +1,6 @@
 import { rawDb } from "@/lib/db";
 import { buildTailoredResume, extractJobProfile, fetchJobContent, generateTailoredPatch, rankResumeDocuments, verifyTailoredPatch } from "@/lib/unified/engine";
+import { extractJobProfileFromWorker, generateTailoredPatchFromWorker, rankResumeDocumentsFromWorker, verifyTailoredPatchFromWorker } from "@/lib/unified/worker-client";
 import { parseImportedResumeHtml } from "@/lib/unified/resume-parser";
 import { renderResumeDataToHtml, renderResumePdfBuffer } from "@/lib/unified/render";
 import { readUnifiedArtifactText, writeStagingHtml, writeUnifiedArtifact } from "@/lib/unified/storage";
@@ -565,12 +566,13 @@ export async function ensureJobExtracted(jobId: string): Promise<Record<string, 
     return getJob(jobId)!;
   }
   rawDb.prepare("UPDATE jobs SET status = 'extracting', processing_stage = 'extracting', fetch_method = ?, description_text = ?, updated_at = ? WHERE id = ?").run(result.method, result.text, nowIso(), jobId);
-  const jobProfile = extractJobProfile({
+  const jobProfileInput = {
     pageTitle: result.title,
     descriptionText: result.text,
     titleHint: intakeItem?.title_hint as string | null | undefined,
     companyHint: intakeItem?.company_hint as string | null | undefined,
-  });
+  };
+  const jobProfile = (await extractJobProfileFromWorker(jobProfileInput)) ?? extractJobProfile(jobProfileInput);
   rawDb.prepare(
     "UPDATE jobs SET status = 'extracted', processing_stage = 'extracted', title = ?, company = ?, location = ?, work_model = ?, seniority = ?, job_profile_json = ?, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?"
   ).run(jobProfile.title, jobProfile.company, jobProfile.location, jobProfile.workModel, jobProfile.seniority, JSON.stringify(jobProfile), nowIso(), jobId);
@@ -597,7 +599,7 @@ export async function runRankingForJob(jobId: string): Promise<Record<string, un
     variantName: row.variant_name,
     document: safeJsonParse(row.structured_json, {} as ImportedResumeDocument),
   }));
-  const results = rankResumeDocuments(jobProfile, documents);
+  const results = (await rankResumeDocumentsFromWorker(jobProfile, documents)) ?? rankResumeDocuments(jobProfile, documents);
   const runId = createId();
   rawDb.prepare("INSERT INTO match_runs (id, job_id, status, summary_json, created_at, updated_at) VALUES (?, ?, 'completed', ?, ?, ?)").run(
     runId,
@@ -715,8 +717,8 @@ export async function runLocalTailorTask(taskId: string, _payload?: Record<strin
   } satisfies RankedResumeCandidate;
   rawDb.prepare("UPDATE tailor_tasks SET status = 'verifying', updated_at = ? WHERE id = ?").run(nowIso(), taskId);
   const baseDocument = loadImportedDocument(baseSnapshot);
-  const patch = generateTailoredPatch(baseDocument, jobProfile, match, "local_ollama");
-  const verifier = verifyTailoredPatch(baseDocument, patch, jobProfile);
+  const patch = (await generateTailoredPatchFromWorker(baseDocument, jobProfile, match, "local_ollama")) ?? generateTailoredPatch(baseDocument, jobProfile, match, "local_ollama");
+  const verifier = (await verifyTailoredPatchFromWorker(baseDocument, patch, jobProfile)) ?? verifyTailoredPatch(baseDocument, patch, jobProfile);
   const verifierId = createVerifierRecord(taskId, verifier);
   let status: TailorTaskStatus = verifier.pass ? "completed" : "manual_review_required";
   let tailoredSnapshotId: string | null = null;
@@ -776,7 +778,7 @@ export async function submitDeepseekTailorTask(params: {
     supportingChunkIds: safeJsonParse(matchRow.supporting_chunk_ids_json as string, [] as string[]),
   } satisfies RankedResumeCandidate;
   const baseDocument = loadImportedDocument(baseSnapshot);
-  const verifier = verifyTailoredPatch(baseDocument, params.patch, jobProfile);
+  const verifier = (await verifyTailoredPatchFromWorker(baseDocument, params.patch, jobProfile)) ?? verifyTailoredPatch(baseDocument, params.patch, jobProfile);
   const verifierId = createVerifierRecord(params.taskId, verifier);
   let status: TailorTaskStatus = verifier.pass ? "completed" : "manual_review_required";
   let tailoredSnapshotId: string | null = null;
