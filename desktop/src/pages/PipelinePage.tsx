@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { FolderOpen, FileSpreadsheet, Link2, Loader2, RefreshCw, Sparkles, UploadCloud } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -272,6 +273,20 @@ function artifactDownloadHref(artifact: ArtifactRow): string {
   return "/api/unified/artifacts/" + artifact.id + "?download=1";
 }
 
+function artifactFileName(artifact: ArtifactRow): string {
+  const parts = artifact.relative_path.split("/");
+  return parts[parts.length - 1] || artifact.artifact_kind;
+}
+
+function artifactPreviewMode(artifact: ArtifactRow): "json" | "pdf" | "html" | "other" {
+  const mimeType = String(artifact.mime_type || "").toLowerCase();
+  const fileName = artifact.relative_path.toLowerCase();
+  if (mimeType.includes("json") || fileName.endsWith(".json")) return "json";
+  if (mimeType.includes("pdf") || fileName.endsWith(".pdf")) return "pdf";
+  if (mimeType.includes("html") || fileName.endsWith(".html")) return "html";
+  return "other";
+}
+
 export function PipelinePage() {
   const { user } = useAuth();
   const desktopApi = getResumeSyncDesktopApi();
@@ -296,6 +311,10 @@ export function PipelinePage() {
   const [queueLoading, setQueueLoading] = useState(false);
   const [workerStatus, setWorkerStatus] = useState<WorkerStatusResponse | null>(null);
   const [workerStatusLoading, setWorkerStatusLoading] = useState(false);
+  const [previewArtifact, setPreviewArtifact] = useState<ArtifactRow | null>(null);
+  const [previewText, setPreviewText] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   const parsedUrlCount = useMemo(() => {
     return urlsText
@@ -351,6 +370,34 @@ export function PipelinePage() {
     if (!res.ok) throw new Error(await readError(res));
     const payload = (await res.json()) as { items: ArtifactRow[] };
     return payload.items || [];
+  };
+
+  const closeArtifactPreview = () => {
+    setPreviewArtifact(null);
+    setPreviewText("");
+    setPreviewError(null);
+    setPreviewLoading(false);
+  };
+
+  const openArtifactPreview = async (artifact: ArtifactRow) => {
+    setPreviewArtifact(artifact);
+    setPreviewText("");
+    setPreviewError(null);
+    const mode = artifactPreviewMode(artifact);
+    if (mode !== "json") {
+      setPreviewLoading(false);
+      return;
+    }
+    try {
+      setPreviewLoading(true);
+      const res = await fetch(artifactPreviewHref(artifact));
+      if (!res.ok) throw new Error(await readError(res));
+      setPreviewText(await res.text());
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : "Failed to load artifact preview");
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   const refreshJob = async (jobId: string) => {
@@ -1047,8 +1094,8 @@ export function PipelinePage() {
                                       <div className="font-mono text-xs text-muted-foreground break-all">{artifact.relative_path}</div>
                                     </div>
                                     <div className="flex flex-wrap gap-2">
-                                      <Button type="button" size="sm" variant="outline" asChild>
-                                        <a href={artifactPreviewHref(artifact)} target="_blank" rel="noreferrer">Preview</a>
+                                      <Button type="button" size="sm" variant="outline" onClick={() => void openArtifactPreview(artifact)}>
+                                        Preview
                                       </Button>
                                       <Button type="button" size="sm" variant="ghost" asChild>
                                         <a href={artifactDownloadHref(artifact)} target="_blank" rel="noreferrer">Download</a>
@@ -1068,6 +1115,48 @@ export function PipelinePage() {
             )}
           </CardContent>
         </Card>
+        <Dialog open={Boolean(previewArtifact)} onOpenChange={(open) => { if (!open) closeArtifactPreview(); }}>
+          <DialogContent className="max-w-6xl h-[85vh] p-0 overflow-hidden" noZoomAnimation>
+            {previewArtifact && (
+              <div className="flex h-full min-h-0 flex-col">
+                <DialogHeader className="border-b px-6 py-4">
+                  <DialogTitle>{previewArtifact.artifact_kind}</DialogTitle>
+                  <DialogDescription className="font-mono text-xs break-all">
+                    {previewArtifact.relative_path}
+                  </DialogDescription>
+                </DialogHeader>
+
+                <div className="min-h-0 flex-1 overflow-hidden bg-muted/10">
+                  {previewError ? (
+                    <div className="p-6 text-sm text-destructive">{previewError}</div>
+                  ) : previewLoading ? (
+                    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading preview…
+                    </div>
+                  ) : artifactPreviewMode(previewArtifact) === "json" ? (
+                    <pre className="h-full overflow-auto p-6 text-xs text-foreground whitespace-pre-wrap break-words">{previewText}</pre>
+                  ) : artifactPreviewMode(previewArtifact) === "pdf" ? (
+                    <iframe title={artifactFileName(previewArtifact)} src={artifactPreviewHref(previewArtifact)} className="h-full w-full border-0 bg-background" />
+                  ) : artifactPreviewMode(previewArtifact) === "html" ? (
+                    <iframe title={artifactFileName(previewArtifact)} src={artifactPreviewHref(previewArtifact)} className="h-full w-full border-0 bg-background" />
+                  ) : (
+                    <iframe title={artifactFileName(previewArtifact)} src={artifactPreviewHref(previewArtifact)} className="h-full w-full border-0 bg-background" />
+                  )}
+                </div>
+
+                <DialogFooter className="border-t px-6 py-4">
+                  <Button type="button" variant="outline" asChild>
+                    <a href={artifactPreviewHref(previewArtifact)} target="_blank" rel="noreferrer">Open in new tab</a>
+                  </Button>
+                  <Button type="button" asChild>
+                    <a href={artifactDownloadHref(previewArtifact)} target="_blank" rel="noreferrer">Download</a>
+                  </Button>
+                </DialogFooter>
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );
