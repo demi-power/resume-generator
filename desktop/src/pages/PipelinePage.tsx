@@ -113,7 +113,13 @@ type UnifiedTaskRow = {
   job_id?: string | null;
   tailor_task_id?: string | null;
   worker_id?: string | null;
+  attempts?: number;
   created_at?: string;
+  updated_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  result_json?: string | null;
+  error_json?: string | null;
 };
 
 type JobRecord = {
@@ -169,6 +175,8 @@ type WorkerStatusSnapshot = {
   idlePollCount?: number;
   lastPollAt?: string | null;
   lastProcessedAt?: string | null;
+  lastTaskId?: string | null;
+  lastResult?: Record<string, unknown>;
   lastError?: string | null;
   providers?: WorkerProviders;
   ollama?: WorkerOllamaStatus;
@@ -236,6 +244,36 @@ function parseJsonArray(value: string | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+function parseJsonObject(value: string | null | undefined): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed) === false) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function getTaskOutcomeSummary(task: UnifiedTaskRow): string {
+  if (task.status === "failed") {
+    const error = parseJsonObject(task.error_json);
+    const message = error?.message;
+    return typeof message === "string" && message.trim() ? message.trim() : "Task failed";
+  }
+  const result = parseJsonObject(task.result_json);
+  if (!result) return "Completed";
+  const reason = result.reason;
+  if (typeof reason === "string" && reason.trim()) return reason.trim();
+  const summary = result.summary;
+  if (typeof summary === "string" && summary.trim()) return summary.trim();
+  const keys = Object.keys(result).filter((key) => key !== "job" && key !== "task");
+  if (keys.length > 0) return "Result keys: " + keys.slice(0, 4).join(", ");
+  return "Completed";
 }
 
 function parseVerifierViolations(value: string | undefined): VerifierViolation[] {
@@ -435,6 +473,7 @@ export function PipelinePage() {
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [busyJobIds, setBusyJobIds] = useState<Record<string, string>>({});
   const [queueItems, setQueueItems] = useState<UnifiedTaskRow[]>([]);
+  const [taskHistoryItems, setTaskHistoryItems] = useState<UnifiedTaskRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(false);
   const [workerStatus, setWorkerStatus] = useState<WorkerStatusResponse | null>(null);
   const [workerStatusLoading, setWorkerStatusLoading] = useState(false);
@@ -498,10 +537,16 @@ export function PipelinePage() {
   const refreshQueue = async () => {
     try {
       setQueueLoading(true);
-      const res = await fetch("/api/unified/tasks?status=queued&status=claimed&limit=20");
-      if (!res.ok) throw new Error(await readError(res));
-      const payload = (await res.json()) as { items: UnifiedTaskRow[] };
-      setQueueItems(payload.items || []);
+      const [openRes, historyRes] = await Promise.all([
+        fetch("/api/unified/tasks?status=queued&status=claimed&limit=20"),
+        fetch("/api/unified/tasks?status=completed&status=failed&limit=30"),
+      ]);
+      if (!openRes.ok) throw new Error(await readError(openRes));
+      if (!historyRes.ok) throw new Error(await readError(historyRes));
+      const openPayload = (await openRes.json()) as { items: UnifiedTaskRow[] };
+      const historyPayload = (await historyRes.json()) as { items: UnifiedTaskRow[] };
+      setQueueItems(openPayload.items || []);
+      setTaskHistoryItems(historyPayload.items || []);
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to load task queue");
     } finally {
@@ -915,6 +960,7 @@ export function PipelinePage() {
               <div className="rounded-md border bg-muted/10 px-4 py-3 text-sm space-y-1">
                 <div><strong>Last poll:</strong> {workerStatus.worker.lastPollAt || "—"}</div>
                 <div><strong>Last processed task:</strong> {workerStatus.worker.lastProcessedAt || "—"}</div>
+                <div><strong>Last task id:</strong> {workerStatus.worker.lastTaskId || "—"}</div>
                 {workerStatus.worker.lastError && <div className="text-destructive"><strong>Last error:</strong> {workerStatus.worker.lastError}</div>}
               </div>
             )}
@@ -942,6 +988,7 @@ export function PipelinePage() {
                 Drain queue
               </Button>
               <span className="text-sm text-muted-foreground">Open tasks: {queueItems.length}</span>
+              <span className="text-sm text-muted-foreground">Processed history: {taskHistoryItems.length}</span>
             </div>
             {queueItems.length > 0 ? (
               <div className="rounded-md border">
@@ -969,6 +1016,42 @@ export function PipelinePage() {
             ) : (
               <p className="text-sm text-muted-foreground">No queued or claimed tasks right now.</p>
             )}
+
+            <div className="space-y-2">
+              <div className="text-sm font-medium">Processed Task History</div>
+              {taskHistoryItems.length > 0 ? (
+                <div className="rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Finished</TableHead>
+                        <TableHead>Type</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead>Job</TableHead>
+                        <TableHead>Worker</TableHead>
+                        <TableHead>Outcome</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {taskHistoryItems.map((task) => (
+                        <TableRow key={task.id}>
+                          <TableCell className="text-xs text-muted-foreground">{task.completed_at || task.updated_at || task.created_at || "—"}</TableCell>
+                          <TableCell>{task.task_type}</TableCell>
+                          <TableCell>
+                            <span className={task.status === "failed" ? "text-destructive" : undefined}>{task.status}</span>
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">{task.job_id || "—"}</TableCell>
+                          <TableCell>{task.worker_id || "—"}</TableCell>
+                          <TableCell className="max-w-[28rem] text-xs text-muted-foreground">{getTaskOutcomeSummary(task)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">No completed or failed tasks have been loaded yet.</p>
+              )}
+            </div>
           </CardContent>
         </Card>
 

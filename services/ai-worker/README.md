@@ -81,8 +81,11 @@ UNIFIED_AI_WORKER_STRICT=1
 
 ## Run locally
 
+Install the worker dependencies first. `python-dotenv` is required if you want to use `uvicorn --env-file ...`.
+
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8100 --reload --env-file .env.local
 ```
 
 Useful endpoints:
