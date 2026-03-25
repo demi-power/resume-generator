@@ -334,6 +334,86 @@ function buildJobSearchText(job: JobRecord): string {
   return parts.join(" ").toLowerCase();
 }
 
+function createVerifierExportRecord(job: JobRecord) {
+  const verifyArtifact = (job.artifacts || []).find((artifact) => artifact.artifact_kind === "verify_json");
+  const matchedRequirements = job.matchResults?.[0] ? parseJsonArray(job.matchResults[0].matched_requirements_json) : [];
+  const missingRequirements = job.matchResults?.[0] ? parseJsonArray(job.matchResults[0].missing_requirements_json) : [];
+  return {
+    jobId: job.id,
+    title: job.title || "",
+    company: job.company || "",
+    canonicalUrl: job.canonical_url,
+    status: job.status,
+    processingStage: job.processing_stage || "",
+    decision: getPrimaryDecision(job),
+    verifierPassed: job.latestVerifierResult ? Number(job.latestVerifierResult.pass) === 1 : false,
+    verifierQualityScore: job.latestVerifierResult?.quality_score ?? null,
+    verifierReason: job.latestVerifierResult?.human_review_reason || getVerifierSummary(job),
+    verifierViolations: job.latestVerifierResult ? parseVerifierViolations(job.latestVerifierResult.violations_json) : [],
+    retryInstructions: job.latestVerifierResult ? parseJsonArray(job.latestVerifierResult.retry_instructions_json) : [],
+    matchedRequirements,
+    missingRequirements,
+    verifyArtifactPreviewUrl: verifyArtifact ? artifactPreviewHref(verifyArtifact) : null,
+    verifyArtifactDownloadUrl: verifyArtifact ? artifactDownloadHref(verifyArtifact) : null,
+    updatedAtHint: job.latestMatchRun?.created_at || null,
+  };
+}
+
+function escapeCsvCell(value: unknown): string {
+  const text = String(value ?? "");
+  if (/[",\n]/.test(text)) {
+    return '"' + text.replace(/"/g, '""') + '"';
+  }
+  return text;
+}
+
+function downloadTextFile(fileName: string, content: string, mimeType: string): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function buildBlockedVerifierCsv(jobs: JobRecord[]): string {
+  const headers = [
+    "job_id",
+    "title",
+    "company",
+    "status",
+    "processing_stage",
+    "decision",
+    "verifier_quality_score",
+    "verifier_reason",
+    "violation_count",
+    "matched_requirements",
+    "missing_requirements",
+    "canonical_url",
+    "verify_artifact_download_url",
+  ];
+  const rows = jobs.map((job) => {
+    const record = createVerifierExportRecord(job);
+    return [
+      record.jobId,
+      record.title,
+      record.company,
+      record.status,
+      record.processingStage,
+      record.decision,
+      record.verifierQualityScore ?? "",
+      record.verifierReason,
+      record.verifierViolations.length,
+      record.matchedRequirements.join(" | "),
+      record.missingRequirements.join(" | "),
+      record.canonicalUrl,
+      record.verifyArtifactDownloadUrl || "",
+    ].map(escapeCsvCell).join(",");
+  });
+  return [headers.join(","), ...rows].join("\n");
+}
+
 export function PipelinePage() {
   const { user } = useAuth();
   const desktopApi = getResumeSyncDesktopApi();
@@ -362,6 +442,7 @@ export function PipelinePage() {
   const [previewText, setPreviewText] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [reviewBulkBusy, setReviewBulkBusy] = useState<string | null>(null);
   const [jobSearch, setJobSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [decisionFilter, setDecisionFilter] = useState("all");
@@ -375,6 +456,10 @@ export function PipelinePage() {
   }, [urlsText]);
 
   const reviewQueueJobs = useMemo(() => jobs.filter((job) => isVerifierBlocked(job)), [jobs]);
+
+  const retryableReviewQueueJobs = useMemo(() => {
+    return reviewQueueJobs.filter((job) => Boolean(job.matchResults?.[0]?.id));
+  }, [reviewQueueJobs]);
 
   const filteredJobs = useMemo(() => {
     const normalizedSearch = jobSearch.trim().toLowerCase();
@@ -394,11 +479,12 @@ export function PipelinePage() {
     return {
       total: jobs.length,
       blocked: reviewQueueJobs.length,
+      retryableBlocked: retryableReviewQueueJobs.length,
       completed: jobs.filter((job) => job.status === "completed").length,
       ranked: jobs.filter((job) => (job.matchResults || []).length > 0).length,
       visible: filteredJobs.length,
     };
-  }, [jobs, reviewQueueJobs, filteredJobs]);
+  }, [jobs, reviewQueueJobs, retryableReviewQueueJobs, filteredJobs]);
 
   const setJobBusy = (jobId: string, value: string | null) => {
     setBusyJobIds((previous) => {
@@ -454,6 +540,49 @@ export function PipelinePage() {
     setPreviewText("");
     setPreviewError(null);
     setPreviewLoading(false);
+  };
+
+  const refreshBlockedJobs = async () => {
+    const targets = [...reviewQueueJobs];
+    if (targets.length === 0) return;
+    try {
+      setReviewBulkBusy("Refreshing blocked jobs…");
+      for (const job of targets) {
+        await refreshJob(job.id);
+      }
+    } finally {
+      setReviewBulkBusy(null);
+    }
+  };
+
+  const retryBlockedJobs = async () => {
+    const targets = [...retryableReviewQueueJobs];
+    if (targets.length === 0) return;
+    try {
+      setReviewBulkBusy("Queueing blocked tailoring retries…");
+      for (const job of targets) {
+        const topMatch = job.matchResults?.[0];
+        if (!topMatch) continue;
+        await tailorJob(job.id, topMatch.id);
+      }
+    } finally {
+      setReviewBulkBusy(null);
+    }
+  };
+
+  const exportBlockedVerifierReportsJson = () => {
+    if (reviewQueueJobs.length === 0) return;
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      count: reviewQueueJobs.length,
+      items: reviewQueueJobs.map(createVerifierExportRecord),
+    };
+    downloadTextFile("blocked-verifier-reports.json", JSON.stringify(payload, null, 2), "application/json");
+  };
+
+  const exportBlockedVerifierReportsCsv = () => {
+    if (reviewQueueJobs.length === 0) return;
+    downloadTextFile("blocked-verifier-reports.csv", buildBlockedVerifierCsv(reviewQueueJobs), "text/csv;charset=utf-8");
   };
 
   const clearJobFilters = () => {
@@ -1013,6 +1142,7 @@ export function PipelinePage() {
             <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
               <span>Total jobs: <strong>{jobSummary.total}</strong></span>
               <span>Blocked: <strong>{jobSummary.blocked}</strong></span>
+              <span>Retryable: <strong>{jobSummary.retryableBlocked}</strong></span>
               <span>Completed: <strong>{jobSummary.completed}</strong></span>
               <span>Ranked: <strong>{jobSummary.ranked}</strong></span>
             </div>
@@ -1020,32 +1150,60 @@ export function PipelinePage() {
               <Button type="button" variant={reviewOnly ? "default" : "outline"} onClick={() => setReviewOnly(reviewOnly ? false : true)}>
                 {reviewOnly ? "Showing blocked only" : "Show blocked only"}
               </Button>
+              <Button type="button" variant="outline" onClick={() => void refreshBlockedJobs()} disabled={Boolean(reviewBulkBusy) || reviewQueueJobs.length === 0}>
+                {reviewBulkBusy === "Refreshing blocked jobs…" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                Refresh blocked
+              </Button>
+              <Button type="button" variant="outline" onClick={() => void retryBlockedJobs()} disabled={Boolean(reviewBulkBusy) || retryableReviewQueueJobs.length === 0}>
+                {reviewBulkBusy === "Queueing blocked tailoring retries…" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
+                Retry local tailor
+              </Button>
+              <Button type="button" variant="outline" onClick={exportBlockedVerifierReportsJson} disabled={reviewQueueJobs.length === 0 || Boolean(reviewBulkBusy)}>
+                Export JSON
+              </Button>
+              <Button type="button" variant="outline" onClick={exportBlockedVerifierReportsCsv} disabled={reviewQueueJobs.length === 0 || Boolean(reviewBulkBusy)}>
+                Export CSV
+              </Button>
               <Button type="button" variant="ghost" onClick={clearJobFilters}>
                 Clear filters
               </Button>
             </div>
+            {reviewBulkBusy && <p className="text-sm text-muted-foreground">{reviewBulkBusy}</p>}
             {reviewQueueJobs.length === 0 ? (
               <p className="text-sm text-muted-foreground">No blocked verifier results right now.</p>
             ) : (
               <div className="space-y-2">
-                {reviewQueueJobs.map((job) => (
-                  <div key={job.id} className="flex flex-col gap-3 rounded-md border bg-muted/10 p-3 lg:flex-row lg:items-start lg:justify-between">
-                    <div className="min-w-0 space-y-1">
-                      <div className="font-medium">{job.title || "Untitled job"}</div>
-                      <div className="text-sm text-muted-foreground">{job.company || "Unknown company"}</div>
-                      <div className="text-xs text-muted-foreground">Status: {job.latestTailorTask?.status || job.status} · Violations: {getVerifierViolationCount(job)}</div>
-                      {getVerifierSummary(job) && <div className="text-xs text-muted-foreground">{getVerifierSummary(job)}</div>}
+                {reviewQueueJobs.map((job) => {
+                  const topMatch = job.matchResults?.[0];
+                  const busyLabel = busyJobIds[job.id];
+                  return (
+                    <div key={job.id} className="flex flex-col gap-3 rounded-md border bg-muted/10 p-3 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="min-w-0 space-y-1">
+                        <div className="font-medium">{job.title || "Untitled job"}</div>
+                        <div className="text-sm text-muted-foreground">{job.company || "Unknown company"}</div>
+                        <div className="text-xs text-muted-foreground">Status: {job.latestTailorTask?.status || job.status} · Violations: {getVerifierViolationCount(job)}</div>
+                        {topMatch ? (
+                          <div className="text-xs text-muted-foreground">Top match: {topMatch.profile_name} / {topMatch.variant_name}</div>
+                        ) : (
+                          <div className="text-xs text-muted-foreground">No ranked match available for retry yet.</div>
+                        )}
+                        {getVerifierSummary(job) && <div className="text-xs text-muted-foreground">{getVerifierSummary(job)}</div>}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button type="button" size="sm" variant="outline" onClick={() => focusReviewJob(job)}>
+                          Focus in list
+                        </Button>
+                        <Button type="button" size="sm" variant="outline" onClick={() => topMatch && void tailorJob(job.id, topMatch.id)} disabled={!topMatch || Boolean(busyLabel) || Boolean(reviewBulkBusy)}>
+                          {busyLabel === "Queueing tailor task…" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
+                          Retry tailor
+                        </Button>
+                        <Button type="button" size="sm" variant="ghost" onClick={() => void refreshJob(job.id)} disabled={Boolean(busyLabel) || Boolean(reviewBulkBusy)}>
+                          Refresh
+                        </Button>
+                      </div>
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button type="button" size="sm" variant="outline" onClick={() => focusReviewJob(job)}>
-                        Focus in list
-                      </Button>
-                      <Button type="button" size="sm" variant="ghost" onClick={() => void refreshJob(job.id)}>
-                        Refresh
-                      </Button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </CardContent>
