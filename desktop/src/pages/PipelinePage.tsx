@@ -287,6 +287,53 @@ function artifactPreviewMode(artifact: ArtifactRow): "json" | "pdf" | "html" | "
   return "other";
 }
 
+function isVerifierBlocked(job: JobRecord): boolean {
+  if (job.latestVerifierResult && Number(job.latestVerifierResult.pass) === 0) return true;
+  if (job.latestTailorTask?.status === "manual_review_required") return true;
+  return job.status === "manual_review_required";
+}
+
+function getPrimaryDecision(job: JobRecord): string {
+  if (isVerifierBlocked(job)) return "blocked_by_verifier";
+  if (job.matchResults && job.matchResults.length > 0) return job.matchResults[0].decision;
+  if (job.latestTailorTask?.status) return job.latestTailorTask.status;
+  return job.status;
+}
+
+function getVerifierViolationCount(job: JobRecord): number {
+  if (!job.latestVerifierResult) return 0;
+  return parseVerifierViolations(job.latestVerifierResult.violations_json).length;
+}
+
+function getVerifierSummary(job: JobRecord): string {
+  if (job.latestVerifierResult?.human_review_reason) return job.latestVerifierResult.human_review_reason;
+  const violations = job.latestVerifierResult ? parseVerifierViolations(job.latestVerifierResult.violations_json) : [];
+  if (violations.length > 0) return violations[0].message;
+  if (job.error_message) return job.error_message;
+  return "";
+}
+
+function buildJobSearchText(job: JobRecord): string {
+  const parts = [
+    job.id,
+    job.title || "",
+    job.company || "",
+    job.canonical_url || "",
+    job.status || "",
+    job.processing_stage || "",
+    getPrimaryDecision(job),
+    getVerifierSummary(job),
+  ];
+  if (job.matchResults) {
+    for (const match of job.matchResults) {
+      parts.push(match.profile_name, match.variant_name, match.reason);
+      parts.push(...parseJsonArray(match.matched_requirements_json));
+      parts.push(...parseJsonArray(match.missing_requirements_json));
+    }
+  }
+  return parts.join(" ").toLowerCase();
+}
+
 export function PipelinePage() {
   const { user } = useAuth();
   const desktopApi = getResumeSyncDesktopApi();
@@ -315,6 +362,10 @@ export function PipelinePage() {
   const [previewText, setPreviewText] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [jobSearch, setJobSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [decisionFilter, setDecisionFilter] = useState("all");
+  const [reviewOnly, setReviewOnly] = useState(false);
 
   const parsedUrlCount = useMemo(() => {
     return urlsText
@@ -322,6 +373,32 @@ export function PipelinePage() {
       .map((value) => value.trim())
       .filter(Boolean).length;
   }, [urlsText]);
+
+  const reviewQueueJobs = useMemo(() => jobs.filter((job) => isVerifierBlocked(job)), [jobs]);
+
+  const filteredJobs = useMemo(() => {
+    const normalizedSearch = jobSearch.trim().toLowerCase();
+    return jobs.filter((job) => {
+      if (reviewOnly && isVerifierBlocked(job) === false) return false;
+      if (statusFilter !== "all" && job.status !== statusFilter) return false;
+      if (decisionFilter !== "all" && getPrimaryDecision(job) !== decisionFilter) return false;
+      if (normalizedSearch) {
+        const haystack = buildJobSearchText(job);
+        if (haystack.includes(normalizedSearch) === false) return false;
+      }
+      return true;
+    });
+  }, [jobs, jobSearch, statusFilter, decisionFilter, reviewOnly]);
+
+  const jobSummary = useMemo(() => {
+    return {
+      total: jobs.length,
+      blocked: reviewQueueJobs.length,
+      completed: jobs.filter((job) => job.status === "completed").length,
+      ranked: jobs.filter((job) => (job.matchResults || []).length > 0).length,
+      visible: filteredJobs.length,
+    };
+  }, [jobs, reviewQueueJobs, filteredJobs]);
 
   const setJobBusy = (jobId: string, value: string | null) => {
     setBusyJobIds((previous) => {
@@ -377,6 +454,20 @@ export function PipelinePage() {
     setPreviewText("");
     setPreviewError(null);
     setPreviewLoading(false);
+  };
+
+  const clearJobFilters = () => {
+    setJobSearch("");
+    setStatusFilter("all");
+    setDecisionFilter("all");
+    setReviewOnly(false);
+  };
+
+  const focusReviewJob = (job: JobRecord) => {
+    setJobSearch((job.title || job.company || job.id || "").trim());
+    setStatusFilter("all");
+    setDecisionFilter("blocked_by_verifier");
+    setReviewOnly(true);
   };
 
   const openArtifactPreview = async (artifact: ArtifactRow) => {
@@ -913,17 +1004,117 @@ export function PipelinePage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-xl">Session Jobs</CardTitle>
+            <CardTitle className="text-xl">Verifier Review Queue</CardTitle>
             <CardDescription>
-              Jobs created in this desktop session. Refresh after queue processing to see extraction, ranking, and local tailoring results.
+              Jobs whose latest tailored result is blocked by the verifier or waiting for manual review.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+              <span>Total jobs: <strong>{jobSummary.total}</strong></span>
+              <span>Blocked: <strong>{jobSummary.blocked}</strong></span>
+              <span>Completed: <strong>{jobSummary.completed}</strong></span>
+              <span>Ranked: <strong>{jobSummary.ranked}</strong></span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" variant={reviewOnly ? "default" : "outline"} onClick={() => setReviewOnly(reviewOnly ? false : true)}>
+                {reviewOnly ? "Showing blocked only" : "Show blocked only"}
+              </Button>
+              <Button type="button" variant="ghost" onClick={clearJobFilters}>
+                Clear filters
+              </Button>
+            </div>
+            {reviewQueueJobs.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No blocked verifier results right now.</p>
+            ) : (
+              <div className="space-y-2">
+                {reviewQueueJobs.map((job) => (
+                  <div key={job.id} className="flex flex-col gap-3 rounded-md border bg-muted/10 p-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0 space-y-1">
+                      <div className="font-medium">{job.title || "Untitled job"}</div>
+                      <div className="text-sm text-muted-foreground">{job.company || "Unknown company"}</div>
+                      <div className="text-xs text-muted-foreground">Status: {job.latestTailorTask?.status || job.status} · Violations: {getVerifierViolationCount(job)}</div>
+                      {getVerifierSummary(job) && <div className="text-xs text-muted-foreground">{getVerifierSummary(job)}</div>}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button type="button" size="sm" variant="outline" onClick={() => focusReviewJob(job)}>
+                        Focus in list
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" onClick={() => void refreshJob(job.id)}>
+                        Refresh
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-xl">Session Jobs</CardTitle>
+            <CardDescription>
+              Jobs created in this desktop session. Use filters to focus on blocked verifier results, job status, or top match decisions.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-3 xl:grid-cols-[2fr_1fr_1fr_auto_auto]">
+              <div className="space-y-1">
+                <Label htmlFor="pipeline-job-search">Search</Label>
+                <Input id="pipeline-job-search" value={jobSearch} onChange={(event) => setJobSearch(event.target.value)} placeholder="Search title, company, URL, match text, or verifier reason" />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pipeline-status-filter">Job status</Label>
+                <select id="pipeline-status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+                  <option value="all">All statuses</option>
+                  <option value="queued">queued</option>
+                  <option value="fetching">fetching</option>
+                  <option value="extracting">extracting</option>
+                  <option value="extracted">extracted</option>
+                  <option value="ranked">ranked</option>
+                  <option value="tailoring">tailoring</option>
+                  <option value="completed">completed</option>
+                  <option value="manual_review_required">manual_review_required</option>
+                  <option value="failed">failed</option>
+                </select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pipeline-decision-filter">Decision</Label>
+                <select id="pipeline-decision-filter" value={decisionFilter} onChange={(event) => setDecisionFilter(event.target.value)} className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm">
+                  <option value="all">All decisions</option>
+                  <option value="use_as_is">use_as_is</option>
+                  <option value="review">review</option>
+                  <option value="need_tailor">need_tailor</option>
+                  <option value="not_eligible">not_eligible</option>
+                  <option value="blocked_by_verifier">blocked_by_verifier</option>
+                </select>
+              </div>
+              <div className="flex items-end">
+                <Button type="button" variant={reviewOnly ? "default" : "outline"} onClick={() => setReviewOnly(reviewOnly ? false : true)}>
+                  {reviewOnly ? "Blocked only" : "Show blocked"}
+                </Button>
+              </div>
+              <div className="flex items-end">
+                <Button type="button" variant="ghost" onClick={clearJobFilters}>
+                  Clear
+                </Button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-4 text-sm text-muted-foreground">
+              <span>Total: <strong>{jobSummary.total}</strong></span>
+              <span>Visible: <strong>{jobSummary.visible}</strong></span>
+              <span>Blocked: <strong>{jobSummary.blocked}</strong></span>
+            </div>
+
             {jobs.length === 0 ? (
               <p className="text-sm text-muted-foreground">No jobs in this session yet.</p>
+            ) : filteredJobs.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No jobs match the current filters.</p>
             ) : (
               <div className="space-y-4">
-                {jobs.map((job) => {
+                {filteredJobs.map((job) => {
                   const busyLabel = busyJobIds[job.id];
                   const matches = job.matchResults || [];
                   return (
