@@ -3,7 +3,7 @@ import { buildTailoredResume, extractJobProfile, fetchJobContent, generateTailor
 import { extractJobProfileFromWorker, generateTailoredPatchFromWorker, rankResumeDocumentsFromWorker, verifyTailoredPatchFromWorker } from "@/lib/unified/worker-client";
 import { parseImportedResumeHtml } from "@/lib/unified/resume-parser";
 import { renderResumeDataToHtml, renderResumePdfBuffer } from "@/lib/unified/render";
-import { readUnifiedArtifactText, writeStagingHtml, writeUnifiedArtifact } from "@/lib/unified/storage";
+import { readUnifiedArtifact, readUnifiedArtifactText, writeStagingHtml, writeUnifiedArtifact } from "@/lib/unified/storage";
 import type {
   GenerationProviderId,
   ImportedResumeDocument,
@@ -812,4 +812,17 @@ export async function submitDeepseekTailorTask(params: {
 
 export function getTailoredArtifacts(snapshotId: string): Array<Record<string, unknown>> {
   return rawDb.prepare("SELECT * FROM artifact_records WHERE owner_type = 'resume_snapshot' AND owner_id = ? ORDER BY created_at ASC").all(snapshotId) as Array<Record<string, unknown>>;
+}
+
+export function getArtifactRecord(artifactId: string): Record<string, unknown> | undefined {
+  return rawDb.prepare("SELECT * FROM artifact_records WHERE id = ?").get(artifactId) as Record<string, unknown> | undefined;
+}
+
+export function readArtifactRecordContents(artifactId: string): { artifact: Record<string, unknown>; contents: Buffer } | undefined {
+  const artifact = getArtifactRecord(artifactId);
+  if (!artifact) return undefined;
+  return {
+    artifact,
+    contents: readUnifiedArtifact(String(artifact.relative_path || "")),
+  };
 }

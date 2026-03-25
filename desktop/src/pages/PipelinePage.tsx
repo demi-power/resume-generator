@@ -88,6 +88,23 @@ type ArtifactRow = {
   mime_type?: string | null;
 };
 
+type FetchAttemptRow = {
+  id: string;
+  method: string;
+  result_code: string;
+  status_code?: number | null;
+  error_message?: string | null;
+  excerpt?: string | null;
+  created_at?: string;
+};
+
+type MatchRunRow = {
+  id: string;
+  status: string;
+  summary_json?: string | null;
+  created_at?: string;
+};
+
 type UnifiedTaskRow = {
   id: string;
   task_type: string;
@@ -108,6 +125,10 @@ type JobRecord = {
   company?: string | null;
   location?: string | null;
   work_model?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  latestMatchRun?: MatchRunRow | null;
+  fetchAttempts?: FetchAttemptRow[];
   latestTailorTask?: TailorTaskRow | null;
   latestVerifierResult?: VerifierResultRow | null;
   matchResults?: MatchResultRow[];
@@ -194,6 +215,8 @@ function mergeJobs(previous: JobRecord[], incoming: JobRecord[]): JobRecord[] {
     byId.set(job.id, {
       ...existing,
       ...job,
+      latestMatchRun: job.latestMatchRun ?? existing?.latestMatchRun,
+      fetchAttempts: job.fetchAttempts ?? existing?.fetchAttempts,
       latestTailorTask: job.latestTailorTask ?? existing?.latestTailorTask,
       latestVerifierResult: job.latestVerifierResult ?? existing?.latestVerifierResult,
       matchResults: job.matchResults ?? existing?.matchResults,
@@ -239,6 +262,14 @@ function formatBytes(value: number): string {
   if (value < 1024) return value + " B";
   if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB";
   return (value / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function artifactPreviewHref(artifact: ArtifactRow): string {
+  return "/api/unified/artifacts/" + artifact.id;
+}
+
+function artifactDownloadHref(artifact: ArtifactRow): string {
+  return "/api/unified/artifacts/" + artifact.id + "?download=1";
 }
 
 export function PipelinePage() {
@@ -885,6 +916,45 @@ export function PipelinePage() {
                         </div>
                       )}
 
+                      {(job.fetchAttempts && job.fetchAttempts.length > 0) || job.latestMatchRun || job.error_code || job.error_message ? (
+                        <details className="rounded-md border bg-muted/10 p-3 text-sm">
+                          <summary className="cursor-pointer font-medium text-foreground">Job diagnostics</summary>
+                          <div className="mt-3 space-y-3">
+                            {(job.error_code || job.error_message) && (
+                              <div className="rounded-md border bg-background/60 p-3 text-sm space-y-1">
+                                {job.error_code && <div><strong>Error code:</strong> {job.error_code}</div>}
+                                {job.error_message && <div><strong>Error message:</strong> {job.error_message}</div>}
+                              </div>
+                            )}
+                            {job.latestMatchRun && (
+                              <div className="rounded-md border bg-background/60 p-3 text-sm space-y-1">
+                                <div><strong>Latest match run:</strong> {job.latestMatchRun.id}</div>
+                                <div><strong>Status:</strong> {job.latestMatchRun.status}</div>
+                                {job.latestMatchRun.summary_json && <div><strong>Summary:</strong> {job.latestMatchRun.summary_json}</div>}
+                              </div>
+                            )}
+                            {job.fetchAttempts && job.fetchAttempts.length > 0 && (
+                              <div className="space-y-2">
+                                <div className="font-medium text-foreground">Fetch attempts</div>
+                                <div className="space-y-2">
+                                  {job.fetchAttempts.map((attempt) => (
+                                    <div key={attempt.id} className="rounded-md border bg-background/60 p-3 text-xs text-muted-foreground space-y-1">
+                                      <div className="flex flex-wrap gap-3">
+                                        <span><strong className="text-foreground">Method:</strong> {attempt.method}</span>
+                                        <span><strong className="text-foreground">Result:</strong> {attempt.result_code}</span>
+                                        {attempt.status_code != null && <span><strong className="text-foreground">HTTP:</strong> {attempt.status_code}</span>}
+                                      </div>
+                                      {attempt.error_message && <div><strong className="text-foreground">Error:</strong> {attempt.error_message}</div>}
+                                      {attempt.excerpt && <div className="line-clamp-4 break-words"><strong className="text-foreground">Excerpt:</strong> {attempt.excerpt}</div>}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </details>
+                      ) : null}
+
                       {matches.length > 0 && (
                         <div className="space-y-3">
                           <h3 className="text-sm font-medium">Top matches</h3>
@@ -967,13 +1037,26 @@ export function PipelinePage() {
                           )}
 
                           {job.artifacts && job.artifacts.length > 0 && (
-                            <div className="space-y-1">
+                            <div className="space-y-2">
                               <div><strong>Artifacts</strong></div>
-                              <ul className="space-y-1 text-xs font-mono text-muted-foreground">
+                              <div className="space-y-2">
                                 {job.artifacts.map((artifact) => (
-                                  <li key={artifact.id}>{artifact.artifact_kind}: {artifact.relative_path}</li>
+                                  <div key={artifact.id} className="flex flex-col gap-2 rounded-md border bg-background/60 p-3 md:flex-row md:items-center md:justify-between">
+                                    <div className="min-w-0 space-y-1">
+                                      <div className="text-sm font-medium">{artifact.artifact_kind}</div>
+                                      <div className="font-mono text-xs text-muted-foreground break-all">{artifact.relative_path}</div>
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      <Button type="button" size="sm" variant="outline" asChild>
+                                        <a href={artifactPreviewHref(artifact)} target="_blank" rel="noreferrer">Preview</a>
+                                      </Button>
+                                      <Button type="button" size="sm" variant="ghost" asChild>
+                                        <a href={artifactDownloadHref(artifact)} target="_blank" rel="noreferrer">Download</a>
+                                      </Button>
+                                    </div>
+                                  </div>
                                 ))}
-                              </ul>
+                              </div>
                             </div>
                           )}
                         </div>
