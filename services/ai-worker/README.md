@@ -19,6 +19,8 @@ Private deployment model:
 
 ## Environment
 
+Copy [.env.example](/media/demi0/New%20Volume/Projects/Real/resume-generator/services/ai-worker/.env.example) to `.env` in this folder or export the same variables before starting the worker.
+
 Worker queue polling:
 
 ```bash
@@ -40,7 +42,7 @@ Optional local model settings for the private pipeline endpoints:
 
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-LOCAL_OLLAMA_MODEL=qwen2.5:7b-instruct
+LOCAL_OLLAMA_MODEL=qwen3:8b
 OLLAMA_EMBED_MODEL=nomic-embed-text
 OLLAMA_TIMEOUT_SECONDS=120
 UNIFIED_WORKER_USE_OLLAMA_EXTRACTION=1
@@ -49,7 +51,7 @@ UNIFIED_WORKER_USE_OLLAMA_GENERATION=1
 UNIFIED_WORKER_USE_OLLAMA_VERIFIER=1
 
 FASTEMBED_MODEL=BAAI/bge-small-en-v1.5
-UNIFIED_WORKER_USE_FASTEMBED_RANKING=1
+UNIFIED_WORKER_USE_FASTEMBED_RANKING=0
 ```
 
 Current provider behavior:
@@ -71,7 +73,7 @@ The Next.js app should use matching worker-call settings:
 ```bash
 UNIFIED_AI_WORKER_BASE_URL=http://127.0.0.1:8100
 UNIFIED_AI_WORKER_TOKEN=replace-me
-UNIFIED_AI_WORKER_STRICT=0
+UNIFIED_AI_WORKER_STRICT=1
 ```
 
 `UNIFIED_WORKER_TOKEN` is for worker-to-Next task polling.

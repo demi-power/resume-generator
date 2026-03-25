@@ -78,6 +78,8 @@ From `desktop/`:
 
 ## Configuration
 
+Copy [.env.example](/media/demi0/New%20Volume/Projects/Real/resume-generator/.env.example) to `.env.local` or export the same variables before starting the Next.js server.
+
 Optional environment variables used by the backend:
 
 - `JWT_SECRET` for signing auth tokens
@@ -89,6 +91,10 @@ Optional environment variables used by the backend:
 - `DEEPSEEK_SYSTEM_MESSAGE` overrides the default AI system prompt
 - `PDF_BASE_URL` base URL used by server-side PDF/export helpers
 - `CRON_SECRET` optional secret for `/api/cron/clear-pdf-cache`
+- `UNIFIED_WORKER_TOKEN` shared token that lets the private Python worker poll internal task APIs
+- `UNIFIED_AI_WORKER_BASE_URL` private base URL for Next.js to call the Python worker directly
+- `UNIFIED_AI_WORKER_TOKEN` optional private token for Next.js to authenticate direct worker pipeline calls
+- `UNIFIED_AI_WORKER_STRICT` set to `1` to fail fast when the direct worker path is configured but unavailable
 
 ## Data And Persistence
 
