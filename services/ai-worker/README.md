@@ -10,7 +10,7 @@ Current role:
 
 Current limitation:
 - task orchestration and persistence still live in the Next.js unified store/runtime
-- ranking, generation, and verification are worker-hosted heuristic implementations today; they are the seam where real model providers should be attached next
+- the worker now supports local provider-backed extraction, ranking, generation, and verification, but it still falls back to heuristics and does not yet own persistence or job orchestration
 
 Private deployment model:
 - run on the same host or private network as the Next.js server
@@ -35,6 +35,30 @@ UNIFIED_WORKER_POLL_INTERVAL_MS=3000
 UNIFIED_WORKER_TASK_TYPES=job_extract,job_rank,tailor_local
 UNIFIED_WORKER_LOG_LEVEL=INFO
 ```
+
+Optional local model settings for the private pipeline endpoints:
+
+```bash
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+LOCAL_OLLAMA_MODEL=qwen2.5:7b-instruct
+OLLAMA_EMBED_MODEL=nomic-embed-text
+OLLAMA_TIMEOUT_SECONDS=120
+UNIFIED_WORKER_USE_OLLAMA_EXTRACTION=1
+UNIFIED_WORKER_USE_OLLAMA_RANKING=1
+UNIFIED_WORKER_USE_OLLAMA_GENERATION=1
+UNIFIED_WORKER_USE_OLLAMA_VERIFIER=1
+
+FASTEMBED_MODEL=BAAI/bge-small-en-v1.5
+UNIFIED_WORKER_USE_FASTEMBED_RANKING=1
+```
+
+Current provider behavior:
+- extraction can use Ollama JSON prompting with heuristic fallback
+- ranking uses FastEmbed/BGE when `fastembed` is installed and `UNIFIED_WORKER_USE_FASTEMBED_RANKING=1`
+- ranking otherwise falls back to Ollama embeddings if `UNIFIED_WORKER_USE_OLLAMA_RANKING=1`
+- tailored-patch generation can use Ollama JSON prompting with heuristic fallback
+- verifier can use Ollama JSON prompting merged with heuristic guardrails
+- on this machine right now `fastembed` is not installed, so the active local embedding path remains Ollama or heuristics
 
 Optional worker API token for private pipeline calls from Next.js:
 
@@ -69,3 +93,5 @@ Useful endpoints:
 - `POST /pipeline/verify-tailor`
 - `POST /contracts/rank`
 - `POST /contracts/verify`
+
+`GET /health` and `GET /worker/status` now include provider mode and Ollama reachability details so you can tell whether the worker is actually using the configured local model runtime or falling back to heuristics.
