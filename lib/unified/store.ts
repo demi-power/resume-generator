@@ -248,6 +248,11 @@ function getLatestMatchRun(jobId: string): Record<string, unknown> | undefined {
   return rawDb.prepare("SELECT * FROM match_runs WHERE job_id = ? ORDER BY created_at DESC LIMIT 1").get(jobId) as Record<string, unknown> | undefined;
 }
 
+function getVerifierResult(id: string | null | undefined): Record<string, unknown> | undefined {
+  if (!id) return undefined;
+  return rawDb.prepare("SELECT * FROM verifier_results WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+}
+
 function loadImportedDocument(snapshot: SnapshotRow): ImportedResumeDocument {
   return safeJsonParse(snapshot.structured_json, {} as ImportedResumeDocument);
 }
@@ -530,9 +535,10 @@ export function getJobStatus(jobId: string): Record<string, unknown> | undefined
   const fetchAttempts = rawDb.prepare("SELECT * FROM job_fetch_attempts WHERE job_id = ? ORDER BY created_at ASC").all(jobId);
   const latestMatchRun = getLatestMatchRun(jobId);
   const latestTailorTask = rawDb.prepare("SELECT * FROM tailor_tasks WHERE job_id = ? ORDER BY created_at DESC LIMIT 1").get(jobId) as Record<string, unknown> | undefined;
+  const latestVerifierResult = getVerifierResult((latestTailorTask?.verifier_result_id as string | null | undefined) ?? null);
   const matchResults = listMatchResults(jobId);
   const unifiedTasks = listUnifiedTasks({ jobId, limit: 20 }) as unknown as Array<Record<string, unknown>>;
-  return { ...job, fetchAttempts, latestMatchRun, latestTailorTask, matchResults, unifiedTasks };
+  return { ...job, fetchAttempts, latestMatchRun, latestTailorTask, latestVerifierResult, matchResults, unifiedTasks };
 }
 
 export async function ensureJobExtracted(jobId: string): Promise<Record<string, unknown>> {

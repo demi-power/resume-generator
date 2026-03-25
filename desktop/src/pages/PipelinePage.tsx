@@ -67,6 +67,20 @@ type TailorTaskRow = {
   verifier_result_id?: string | null;
 };
 
+type VerifierViolation = {
+  type: string;
+  message: string;
+};
+
+type VerifierResultRow = {
+  id: string;
+  pass: number;
+  quality_score: number;
+  violations_json: string;
+  retry_instructions_json: string;
+  human_review_reason?: string | null;
+};
+
 type ArtifactRow = {
   id: string;
   artifact_kind: string;
@@ -95,9 +109,55 @@ type JobRecord = {
   location?: string | null;
   work_model?: string | null;
   latestTailorTask?: TailorTaskRow | null;
+  latestVerifierResult?: VerifierResultRow | null;
   matchResults?: MatchResultRow[];
   unifiedTasks?: UnifiedTaskRow[];
   artifacts?: ArtifactRow[];
+};
+
+type WorkerProviders = {
+  extraction?: string;
+  ranking?: string;
+  generation?: string;
+  verifier?: string;
+  fallbacksEnabled?: boolean;
+};
+
+type WorkerOllamaStatus = {
+  reachable?: boolean;
+  baseUrl?: string;
+  model?: string;
+  embedModel?: string;
+  modelAvailable?: boolean;
+  embedModelAvailable?: boolean;
+  error?: string | null;
+};
+
+type WorkerFastembedStatus = {
+  available?: boolean;
+  model?: string;
+  enabledForRanking?: boolean;
+};
+
+type WorkerStatusSnapshot = {
+  running?: boolean;
+  workerId?: string;
+  enabled?: boolean;
+  processedCount?: number;
+  idlePollCount?: number;
+  lastPollAt?: string | null;
+  lastProcessedAt?: string | null;
+  lastError?: string | null;
+  providers?: WorkerProviders;
+  ollama?: WorkerOllamaStatus;
+  fastembed?: WorkerFastembedStatus;
+};
+
+type WorkerStatusResponse = {
+  configured: boolean;
+  connected: boolean;
+  worker: WorkerStatusSnapshot | null;
+  error?: string | null;
 };
 
 type ResumeSyncDesktopApi = {
@@ -135,6 +195,7 @@ function mergeJobs(previous: JobRecord[], incoming: JobRecord[]): JobRecord[] {
       ...existing,
       ...job,
       latestTailorTask: job.latestTailorTask ?? existing?.latestTailorTask,
+      latestVerifierResult: job.latestVerifierResult ?? existing?.latestVerifierResult,
       matchResults: job.matchResults ?? existing?.matchResults,
       unifiedTasks: job.unifiedTasks ?? existing?.unifiedTasks,
       artifacts: job.artifacts ?? existing?.artifacts,
@@ -148,6 +209,23 @@ function parseJsonArray(value: string | undefined): string[] {
   try {
     const parsed = JSON.parse(value) as unknown;
     return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseVerifierViolations(value: string | undefined): VerifierViolation[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map((item) => ({
+        type: String(item.type || "format_violation"),
+        message: String(item.message || ""),
+      }))
+      .filter((item) => item.message.trim().length > 0);
   } catch {
     return [];
   }
@@ -185,6 +263,8 @@ export function PipelinePage() {
   const [busyJobIds, setBusyJobIds] = useState<Record<string, string>>({});
   const [queueItems, setQueueItems] = useState<UnifiedTaskRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(false);
+  const [workerStatus, setWorkerStatus] = useState<WorkerStatusResponse | null>(null);
+  const [workerStatusLoading, setWorkerStatusLoading] = useState(false);
 
   const parsedUrlCount = useMemo(() => {
     return urlsText
@@ -216,6 +296,25 @@ export function PipelinePage() {
     }
   };
 
+  const refreshWorkerStatus = async () => {
+    try {
+      setWorkerStatusLoading(true);
+      const res = await fetch("/api/unified/worker/status");
+      if (!res.ok) throw new Error(await readError(res));
+      const payload = (await res.json()) as WorkerStatusResponse;
+      setWorkerStatus(payload);
+    } catch (error) {
+      setWorkerStatus({
+        configured: true,
+        connected: false,
+        worker: null,
+        error: error instanceof Error ? error.message : "Failed to load worker status",
+      });
+    } finally {
+      setWorkerStatusLoading(false);
+    }
+  };
+
   const loadArtifactsForSnapshot = async (snapshotId: string): Promise<ArtifactRow[]> => {
     const res = await fetch("/api/tailored/" + snapshotId + "/artifacts");
     if (!res.ok) throw new Error(await readError(res));
@@ -228,13 +327,18 @@ export function PipelinePage() {
       setJobBusy(jobId, "Refreshing…");
       const res = await fetch("/api/jobs/" + jobId + "/status");
       if (!res.ok) throw new Error(await readError(res));
-      const payload = (await res.json()) as JobRecord & { latestTailorTask?: TailorTaskRow | null; matchResults?: MatchResultRow[] };
+      const payload = (await res.json()) as JobRecord & {
+        latestTailorTask?: TailorTaskRow | null;
+        latestVerifierResult?: VerifierResultRow | null;
+        matchResults?: MatchResultRow[];
+      };
       let artifacts: ArtifactRow[] | undefined;
       if (payload.latestTailorTask?.tailored_snapshot_id) {
         artifacts = await loadArtifactsForSnapshot(payload.latestTailorTask.tailored_snapshot_id);
       }
       setJobs((previous) => mergeJobs(previous, [{ ...payload, artifacts }]));
       await refreshQueue();
+      await refreshWorkerStatus();
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to refresh job");
     } finally {
@@ -250,9 +354,11 @@ export function PipelinePage() {
       const payload = (await res.json()) as { processed: boolean; item?: UnifiedTaskRow | null };
       if (!payload.processed || !payload.item) {
         await refreshQueue();
+        await refreshWorkerStatus();
         return false;
       }
       await refreshQueue();
+      await refreshWorkerStatus();
       if (payload.item.job_id) {
         await refreshJob(payload.item.job_id);
       }
@@ -274,6 +380,7 @@ export function PipelinePage() {
 
   useEffect(() => {
     void refreshQueue();
+    void refreshWorkerStatus();
   }, []);
 
   if (user?.role !== "admin") {
@@ -371,6 +478,7 @@ export function PipelinePage() {
       const payload = (await res.json()) as { items: JobRecord[] };
       setJobs((previous) => mergeJobs(previous, payload.items || []));
       await refreshQueue();
+      await refreshWorkerStatus();
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Job intake failed");
     } finally {
@@ -395,6 +503,7 @@ export function PipelinePage() {
       const payload = (await res.json()) as { items: JobRecord[] };
       setJobs((previous) => mergeJobs(previous, payload.items || []));
       await refreshQueue();
+      await refreshWorkerStatus();
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "CSV intake failed");
     } finally {
@@ -412,6 +521,7 @@ export function PipelinePage() {
         setJobs((previous) => mergeJobs(previous, [payload.job]));
       }
       await refreshQueue();
+      await refreshWorkerStatus();
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to queue ranking");
     } finally {
@@ -432,6 +542,7 @@ export function PipelinePage() {
       const nextJob = payload.job ? { ...payload.job, latestTailorTask: payload.task ?? payload.job.latestTailorTask } : ({ id: jobId, latestTailorTask: payload.task } as JobRecord);
       setJobs((previous) => mergeJobs(previous, [nextJob]));
       await refreshQueue();
+      await refreshWorkerStatus();
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to queue tailoring");
     } finally {
@@ -445,15 +556,78 @@ export function PipelinePage() {
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold">Unified Pipeline</h1>
           <p className="text-sm text-muted-foreground">
-            The desktop app now queues extraction, ranking, and local tailoring. Use the task controls below to process work until the Python worker takes over that role.
+            The desktop app now queues extraction, ranking, and local tailoring. The cards below show both the queue state and whether the private Python worker is actually connected, running, and using local model providers.
           </p>
         </div>
 
         <Card>
           <CardHeader>
+            <CardTitle className="text-xl">Worker Status</CardTitle>
+            <CardDescription>
+              Private worker connectivity, provider mode, and local model readiness as seen from the Next.js server.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button type="button" variant="outline" onClick={() => void refreshWorkerStatus()} disabled={workerStatusLoading}>
+                {workerStatusLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                Refresh worker
+              </Button>
+              <span className="text-sm text-muted-foreground">Configured: <strong>{workerStatus?.configured ? "yes" : "no"}</strong></span>
+              <span className="text-sm text-muted-foreground">Connected: <strong>{workerStatus?.connected ? "yes" : "no"}</strong></span>
+              <span className="text-sm text-muted-foreground">Running: <strong>{workerStatus?.worker?.running ? "yes" : "no"}</strong></span>
+            </div>
+
+            {workerStatus?.error && <p className="text-sm text-destructive">{workerStatus.error}</p>}
+
+            {workerStatus?.worker ? (
+              <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">Worker</div>
+                  <div><strong>ID:</strong> {workerStatus.worker.workerId || "—"}</div>
+                  <div><strong>Processed:</strong> {workerStatus.worker.processedCount ?? 0}</div>
+                  <div><strong>Idle polls:</strong> {workerStatus.worker.idlePollCount ?? 0}</div>
+                </div>
+                <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">Providers</div>
+                  <div><strong>Extract:</strong> {workerStatus.worker.providers?.extraction || "—"}</div>
+                  <div><strong>Rank:</strong> {workerStatus.worker.providers?.ranking || "—"}</div>
+                  <div><strong>Generate:</strong> {workerStatus.worker.providers?.generation || "—"}</div>
+                  <div><strong>Verify:</strong> {workerStatus.worker.providers?.verifier || "—"}</div>
+                </div>
+                <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">Ollama</div>
+                  <div><strong>Reachable:</strong> {workerStatus.worker.ollama?.reachable ? "yes" : "no"}</div>
+                  <div><strong>Chat model:</strong> {workerStatus.worker.ollama?.model || "—"}</div>
+                  <div><strong>Embed model:</strong> {workerStatus.worker.ollama?.embedModel || "—"}</div>
+                  <div><strong>Model ready:</strong> {workerStatus.worker.ollama?.modelAvailable ? "yes" : "no"}</div>
+                </div>
+                <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">FastEmbed</div>
+                  <div><strong>Available:</strong> {workerStatus.worker.fastembed?.available ? "yes" : "no"}</div>
+                  <div><strong>Enabled for rank:</strong> {workerStatus.worker.fastembed?.enabledForRanking ? "yes" : "no"}</div>
+                  <div><strong>Model:</strong> {workerStatus.worker.fastembed?.model || "—"}</div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">The server could not retrieve a worker status snapshot yet.</p>
+            )}
+
+            {workerStatus?.worker && (
+              <div className="rounded-md border bg-muted/10 px-4 py-3 text-sm space-y-1">
+                <div><strong>Last poll:</strong> {workerStatus.worker.lastPollAt || "—"}</div>
+                <div><strong>Last processed task:</strong> {workerStatus.worker.lastProcessedAt || "—"}</div>
+                {workerStatus.worker.lastError && <div className="text-destructive"><strong>Last error:</strong> {workerStatus.worker.lastError}</div>}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
             <CardTitle className="text-xl">Task Queue</CardTitle>
             <CardDescription>
-              Temporary operator controls for the new queue-backed execution model. This is the bridge until a long-running worker drains the queue automatically.
+              Operator controls for the queue-backed execution model. Use these if you want to force progress manually or inspect what the background worker still has pending.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -750,11 +924,48 @@ export function PipelinePage() {
                       )}
 
                       {job.latestTailorTask && (
-                        <div className="rounded-md border bg-muted/20 p-3 text-sm space-y-2">
-                          <div><strong>Last tailor task:</strong> {job.latestTailorTask.id}</div>
-                          <div><strong>Status:</strong> {job.latestTailorTask.status}</div>
-                          <div><strong>Provider:</strong> {job.latestTailorTask.provider}</div>
-                          {job.latestTailorTask.tailored_snapshot_id && <div><strong>Snapshot:</strong> {job.latestTailorTask.tailored_snapshot_id}</div>}
+                        <div className="rounded-md border bg-muted/20 p-3 text-sm space-y-3">
+                          <div className="space-y-1">
+                            <div><strong>Last tailor task:</strong> {job.latestTailorTask.id}</div>
+                            <div><strong>Status:</strong> {job.latestTailorTask.status}</div>
+                            <div><strong>Provider:</strong> {job.latestTailorTask.provider}</div>
+                            {job.latestTailorTask.tailored_snapshot_id && <div><strong>Snapshot:</strong> {job.latestTailorTask.tailored_snapshot_id}</div>}
+                          </div>
+
+                          {job.latestVerifierResult && (
+                            <div className="rounded-md border bg-background/60 p-3 space-y-2">
+                              <div className="flex flex-wrap items-center gap-3">
+                                <span><strong>Verifier:</strong> {job.latestVerifierResult.pass ? "pass" : "blocked"}</span>
+                                <span><strong>Quality:</strong> {formatPercent(job.latestVerifierResult.quality_score || 0)}</span>
+                              </div>
+                              {job.latestVerifierResult.human_review_reason && (
+                                <p className="text-sm text-muted-foreground">{job.latestVerifierResult.human_review_reason}</p>
+                              )}
+                              {parseVerifierViolations(job.latestVerifierResult.violations_json).length > 0 && (
+                                <div className="space-y-1">
+                                  <div><strong>Violations</strong></div>
+                                  <ul className="space-y-1 text-xs text-muted-foreground">
+                                    {parseVerifierViolations(job.latestVerifierResult.violations_json).map((violation, index) => (
+                                      <li key={violation.type + violation.message + index}>
+                                        {violation.type}: {violation.message}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {parseJsonArray(job.latestVerifierResult.retry_instructions_json).length > 0 && (
+                                <div className="space-y-1">
+                                  <div><strong>Retry instructions</strong></div>
+                                  <ul className="space-y-1 text-xs text-muted-foreground">
+                                    {parseJsonArray(job.latestVerifierResult.retry_instructions_json).map((instruction, index) => (
+                                      <li key={instruction + index}>{instruction}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
                           {job.artifacts && job.artifacts.length > 0 && (
                             <div className="space-y-1">
                               <div><strong>Artifacts</strong></div>
