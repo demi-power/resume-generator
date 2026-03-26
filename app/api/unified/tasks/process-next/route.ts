@@ -9,7 +9,7 @@ export async function POST(request: Request) {
   if (operator instanceof NextResponse) return operator;
   const body = (await request.json().catch(() => ({}))) as {
     workerId?: string;
-    taskTypes?: Array<"job_extract" | "job_rank" | "tailor_local">;
+    taskTypes?: Array<"job_fetch" | "job_extract" | "job_rank" | "tailor_generate" | "tailor_verify">;
   };
   const workerId = body.workerId?.trim() || (operator.kind === "worker" ? operator.id : "inline-" + operator.user.id);
   const result = await processNextUnifiedTask({ workerId, taskTypes: body.taskTypes });

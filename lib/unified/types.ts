@@ -6,7 +6,19 @@ export type ResumeSyncUploadStatus = "pending" | "uploaded" | "skipped";
 export type ResumeSnapshotKind = "imported" | "tailored";
 export type ResumeSnapshotStatus = "active" | "archived" | "manual_review_required" | "parse_failed" | "processing";
 export type JobSourceType = "url" | "csv";
-export type JobStatus = "queued" | "fetching" | "fetched" | "extracting" | "extracted" | "ranking" | "ranked" | "tailoring" | "completed" | "manual_review_required" | "failed";
+export type JobStatus =
+  | "queued"
+  | "fetching"
+  | "fetched"
+  | "extracting"
+  | "extracted"
+  | "ranking"
+  | "ranked"
+  | "tailoring"
+  | "verifying"
+  | "completed"
+  | "manual_review_required"
+  | "failed";
 export type JobFetchResultCode =
   | "SUCCESS"
   | "EXPIRED"
@@ -19,8 +31,20 @@ export type JobFetchResultCode =
   | "RETRYABLE_ERROR"
   | "PERMANENT_ERROR";
 export type MatchDecision = "use_as_is" | "review" | "need_tailor" | "not_eligible";
-export type TailorTaskStatus = "queued" | "awaiting_claim" | "claimed" | "submitted" | "verifying" | "completed" | "manual_review_required" | "failed";
+export type TailorTaskStatus =
+  | "queued"
+  | "awaiting_claim"
+  | "claimed"
+  | "awaiting_verifier_claim"
+  | "verifier_claimed"
+  | "generating"
+  | "submitted"
+  | "verifying"
+  | "completed"
+  | "manual_review_required"
+  | "failed";
 export type GenerationProviderId = "deepseek_webview" | "local_ollama";
+export type VerifierProviderId = "local_ollama" | "chatgpt_webview";
 export type ArtifactOwnerType = "resume_snapshot" | "job" | "match_run" | "tailor_task";
 
 export interface ResumeChunk {

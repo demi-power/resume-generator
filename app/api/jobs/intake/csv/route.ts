@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createJobsFromUrls, enqueueJobExtraction } from "@/lib/unified/store";
+import { createJobsFromUrls, enqueueJobFetch } from "@/lib/unified/store";
 import { requireUnifiedOwner } from "@/lib/unified/route-helpers";
 import { parseCsvText } from "@/lib/unified/utils";
 
@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     .filter((row) => row.url.trim());
   const items = createJobsFromUrls({ submittedBy: user.id, sourceType: "csv", urls });
   const tasks = items
-    .map((item) => enqueueJobExtraction(String(item.id), user.id))
+    .map((item) => enqueueJobFetch(String(item.id), user.id))
     .filter(Boolean);
   return NextResponse.json({ items, tasks, queued: tasks.length });
 }

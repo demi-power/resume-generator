@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("electron", {
   readResumeSyncFile: (payload) => ipcRenderer.invoke("read-resume-sync-file", payload),
   getDeepSeekCookies: () => ipcRenderer.invoke("get-deepseek-cookies"),
   setDeepSeekCookies: (cookies) => ipcRenderer.invoke("set-deepseek-cookies", cookies),
+  getChatGptCookies: () => ipcRenderer.invoke("get-chatgpt-cookies"),
+  setChatGptCookies: (cookies) => ipcRenderer.invoke("set-chatgpt-cookies", cookies),
   writeClipboardText: (text) => ipcRenderer.invoke("write-clipboard-text", text),
   setProfileFlyoutHover: (hovering) => ipcRenderer.invoke("set-profile-flyout-hover", hovering),
   getProfileFlyoutSummary: () => ipcRenderer.invoke("get-profile-flyout-summary"),

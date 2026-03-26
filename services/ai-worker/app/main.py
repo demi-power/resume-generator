@@ -104,6 +104,9 @@ class WorkerRuntimeState(BaseModel):
     pollIntervalMs: int = 3000
     ollamaBaseUrl: str = ""
     ollamaModel: str = ""
+    ollamaExtractModel: str = ""
+    ollamaGenerationModel: str = ""
+    ollamaVerifierModel: str = ""
     ollamaEmbedModel: str = ""
     fastembedModel: str = ""
     fastembedAvailable: bool = False
@@ -157,7 +160,10 @@ def load_worker_config() -> Dict[str, Any]:
         "poll_interval_ms": max(250, int(os.getenv("UNIFIED_WORKER_POLL_INTERVAL_MS", "3000"))),
         "task_types": task_types,
         "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/"),
-        "ollama_model": os.getenv("LOCAL_OLLAMA_MODEL", "qwen2.5:7b-instruct").strip() or "qwen2.5:7b-instruct",
+        "ollama_extract_model": os.getenv("LOCAL_OLLAMA_EXTRACT_MODEL", os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b")).strip() or os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b",
+        "ollama_generation_model": os.getenv("LOCAL_OLLAMA_GENERATION_MODEL", os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b")).strip() or os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b",
+        "ollama_verifier_model": os.getenv("LOCAL_OLLAMA_VERIFIER_MODEL", os.getenv("LOCAL_OLLAMA_MODEL", "deepseek-r1:8b")).strip() or os.getenv("LOCAL_OLLAMA_MODEL", "deepseek-r1:8b").strip() or "deepseek-r1:8b",
+        "ollama_model": os.getenv("LOCAL_OLLAMA_GENERATION_MODEL", os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b")).strip() or os.getenv("LOCAL_OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b",
         "ollama_embed_model": os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text").strip() or "nomic-embed-text",
         "ollama_timeout_seconds": max(10, int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))),
         "fastembed_model": os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5").strip() or "BAAI/bge-small-en-v1.5",
@@ -170,6 +176,17 @@ def load_worker_config() -> Dict[str, Any]:
     }
 
 
+def get_stage_model(stage: str, config: Optional[Dict[str, Any]] = None) -> str:
+    config = config or load_worker_config()
+    if stage == "extract":
+        return str(config["ollama_extract_model"])
+    if stage == "verifier":
+        return str(config["ollama_verifier_model"])
+    if stage == "generation":
+        return str(config["ollama_generation_model"])
+    return str(config["ollama_model"])
+
+
 def snapshot_worker_state() -> WorkerRuntimeState:
     config = load_worker_config()
     with worker_lock:
@@ -180,6 +197,9 @@ def snapshot_worker_state() -> WorkerRuntimeState:
         worker_state.pollIntervalMs = int(config["poll_interval_ms"])
         worker_state.ollamaBaseUrl = str(config["ollama_base_url"])
         worker_state.ollamaModel = str(config["ollama_model"])
+        worker_state.ollamaExtractModel = str(config["ollama_extract_model"])
+        worker_state.ollamaGenerationModel = str(config["ollama_generation_model"])
+        worker_state.ollamaVerifierModel = str(config["ollama_verifier_model"])
         worker_state.ollamaEmbedModel = str(config["ollama_embed_model"])
         worker_state.fastembedModel = str(config["fastembed_model"])
         worker_state.fastembedAvailable = bool(config["fastembed_available"])
@@ -543,16 +563,24 @@ def get_fastembed_status() -> Dict[str, Any]:
 def get_ollama_status() -> Dict[str, Any]:
     config = load_worker_config()
     base_url = str(config["ollama_base_url"])
-    model = str(config["ollama_model"])
+    extract_model = get_stage_model("extract", config)
+    generation_model = get_stage_model("generation", config)
+    verifier_model = get_stage_model("verifier", config)
     embed_model = str(config["ollama_embed_model"])
     if not base_url:
         return {
             "reachable": False,
             "baseUrl": "",
-            "model": model,
+            "model": generation_model,
+            "extractModel": extract_model,
+            "generationModel": generation_model,
+            "verifierModel": verifier_model,
             "embedModel": embed_model,
             "availableModels": [],
             "modelAvailable": False,
+            "extractModelAvailable": False,
+            "generationModelAvailable": False,
+            "verifierModelAvailable": False,
             "embedModelAvailable": False,
             "error": "OLLAMA_BASE_URL is not configured",
         }
@@ -568,10 +596,16 @@ def get_ollama_status() -> Dict[str, Any]:
         return {
             "reachable": True,
             "baseUrl": base_url,
-            "model": model,
+            "model": generation_model,
+            "extractModel": extract_model,
+            "generationModel": generation_model,
+            "verifierModel": verifier_model,
             "embedModel": embed_model,
             "availableModels": names[:20],
-            "modelAvailable": model in names,
+            "modelAvailable": generation_model in names,
+            "extractModelAvailable": extract_model in names,
+            "generationModelAvailable": generation_model in names,
+            "verifierModelAvailable": verifier_model in names,
             "embedModelAvailable": embed_model in names,
             "error": None,
         }
@@ -579,10 +613,16 @@ def get_ollama_status() -> Dict[str, Any]:
         return {
             "reachable": False,
             "baseUrl": base_url,
-            "model": model,
+            "model": generation_model,
+            "extractModel": extract_model,
+            "generationModel": generation_model,
+            "verifierModel": verifier_model,
             "embedModel": embed_model,
             "availableModels": [],
             "modelAvailable": False,
+            "extractModelAvailable": False,
+            "generationModelAvailable": False,
+            "verifierModelAvailable": False,
             "embedModelAvailable": False,
             "error": str(error),
         }
@@ -634,9 +674,9 @@ def normalized_cosine(left: List[float], right: List[float]) -> float:
     return clamp_score((cosine_similarity(left, right) + 1.0) / 2.0)
 
 
-def ollama_chat_json(system_prompt: str, user_payload: Dict[str, Any], temperature: float = 0.1) -> Optional[Dict[str, Any]]:
+def ollama_chat_json(system_prompt: str, user_payload: Dict[str, Any], temperature: float = 0.1, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
     config = load_worker_config()
-    model = str(config["ollama_model"])
+    model = normalize_whitespace(model or get_stage_model("generation", config)) or get_stage_model("generation", config)
     payload = {
         "model": model,
         "stream": False,
@@ -766,6 +806,7 @@ def extract_job_profile_with_ollama(payload: ExtractJobProfileRequest) -> Option
             "descriptionText": payload.descriptionText,
             "knownTechTerms": KNOWN_TECH_TERMS,
         },
+        model=get_stage_model("extract"),
     )
     if not candidate:
         return None
@@ -966,7 +1007,7 @@ def build_default_patch(base_document: Dict[str, Any], job_profile: Dict[str, An
         "providerMetadata": {
             "requested_provider": provider_id,
             "effective_provider": "worker-heuristic",
-            "configured_model": os.getenv("LOCAL_OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+            "configured_model": get_stage_model("generation"),
         },
     }
 
@@ -1020,7 +1061,7 @@ def sanitize_resume_patch(candidate: Dict[str, Any], base_document: Dict[str, An
         {
             "requested_provider": provider_id,
             "effective_provider": effective_provider,
-            "configured_model": os.getenv("LOCAL_OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+            "configured_model": get_stage_model("generation"),
         }
     )
     return {
@@ -1055,7 +1096,7 @@ def generate_tailored_patch_with_ollama(base_document: Dict[str, Any], job_profi
             "experience": resume_data.get("experience") or [],
         },
     }
-    candidate = ollama_chat_json(system_prompt, payload, temperature=0.2)
+    candidate = ollama_chat_json(system_prompt, payload, temperature=0.2, model=get_stage_model("generation"))
     if not candidate:
         return None
     if isinstance(candidate.get("patch"), dict):
@@ -1117,7 +1158,7 @@ def verify_tailored_patch_local(base_document: Dict[str, Any], patch: Dict[str, 
         "humanReviewReason": "Verifier blocked the tailored output." if unique_violations else None,
         "providerMetadata": {
             "verifier": "worker-heuristic",
-            "configured_model": os.getenv("LOCAL_OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+            "configured_model": get_stage_model("verifier"),
         },
     }
 
@@ -1159,7 +1200,7 @@ def sanitize_verifier_result(candidate: Dict[str, Any], fallback: Dict[str, Any]
     provider_metadata.update(
         {
             "verifier": effective_provider,
-            "configured_model": os.getenv("LOCAL_OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+            "configured_model": get_stage_model("verifier"),
         }
     )
     human_review_reason = candidate.get("humanReviewReason") if "humanReviewReason" in candidate else candidate.get("human_review_reason")
@@ -1192,6 +1233,7 @@ def verify_tailored_patch_with_ollama(base_document: Dict[str, Any], patch: Dict
             "patch": patch,
         },
         temperature=0.0,
+        model=get_stage_model("verifier"),
     )
     if not candidate:
         return None
@@ -1215,6 +1257,9 @@ def process_next_task_once() -> Dict[str, Any]:
         pollIntervalMs=int(config["poll_interval_ms"]),
         ollamaBaseUrl=str(config["ollama_base_url"]),
         ollamaModel=str(config["ollama_model"]),
+        ollamaExtractModel=str(config["ollama_extract_model"]),
+        ollamaGenerationModel=str(config["ollama_generation_model"]),
+        ollamaVerifierModel=str(config["ollama_verifier_model"]),
         ollamaEmbedModel=str(config["ollama_embed_model"]),
         fastembedModel=str(config["fastembed_model"]),
         fastembedAvailable=bool(config["fastembed_available"]),
@@ -1332,6 +1377,9 @@ def health() -> Dict[str, Any]:
             "taskApiBaseUrl": state.taskApiBaseUrl,
             "ollamaBaseUrl": state.ollamaBaseUrl,
             "ollamaModel": state.ollamaModel,
+            "ollamaExtractModel": state.ollamaExtractModel,
+            "ollamaGenerationModel": state.ollamaGenerationModel,
+            "ollamaVerifierModel": state.ollamaVerifierModel,
             "ollamaEmbedModel": state.ollamaEmbedModel,
             "fastembedModel": state.fastembedModel,
             "fastembedAvailable": state.fastembedAvailable,

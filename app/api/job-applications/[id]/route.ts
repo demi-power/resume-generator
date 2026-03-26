@@ -6,6 +6,7 @@ import {
   updateJobApplication,
   deleteJobApplication,
 } from "@/lib/db";
+import { getUnifiedJobSummary } from "@/lib/unified/store";
 import { requireUser } from "@/lib/auth";
 
 const JOB_PDFS_DIR = path.join(process.cwd(), "data", "job-pdfs");
@@ -20,6 +21,15 @@ function deleteJobPdfIfExists(id: string): void {
 function userCanAccessProfile(user: { role: string; assigned_profile_id: string | null }, profileId: string | null): boolean {
   if (user.role === "admin") return true;
   return profileId !== null && profileId === user.assigned_profile_id;
+}
+
+function withUnifiedJob(row: Record<string, unknown>) {
+  const unifiedJobId = typeof row.unified_job_id === "string" ? row.unified_job_id.trim() : "";
+  if (!unifiedJobId) return row;
+  return {
+    ...row,
+    unifiedJob: getUnifiedJobSummary(unifiedJobId) ?? null,
+  };
 }
 
 export async function GET(
@@ -42,7 +52,7 @@ export async function GET(
     if (!userCanAccessProfile(user, row.profile_id)) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
-    return NextResponse.json(row);
+    return NextResponse.json(withUnifiedJob(row as unknown as Record<string, unknown>));
   } catch (e) {
     console.error(e);
     return NextResponse.json(
@@ -109,7 +119,7 @@ export async function PATCH(
     }
     updateJobApplication(id, updates);
     const row = getJobApplication(id)!;
-    return NextResponse.json(row);
+    return NextResponse.json(withUnifiedJob(row as unknown as Record<string, unknown>));
   } catch (e) {
     console.error(e);
     return NextResponse.json(

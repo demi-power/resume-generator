@@ -4,7 +4,7 @@ This service is the Python-side worker for the unified tailor platform.
 
 Current role:
 - polls the Next.js task API in the background when enabled
-- drains queued `job_extract`, `job_rank`, and `tailor_local` tasks through the private worker token path
+- drains queued staged tasks through the private worker token path: `job_fetch`, `job_extract`, `job_rank`, `tailor_generate`, and `tailor_verify`
 - exposes private pipeline endpoints for job-profile extraction, ranking, tailored-patch generation, and verification
 - keeps a runtime status surface at `/worker/status`
 
@@ -34,7 +34,7 @@ Worker runtime options:
 ```bash
 UNIFIED_WORKER_ID=python-worker
 UNIFIED_WORKER_POLL_INTERVAL_MS=3000
-UNIFIED_WORKER_TASK_TYPES=job_extract,job_rank,tailor_local
+UNIFIED_WORKER_TASK_TYPES=job_extract,tailor_generate,tailor_verify
 UNIFIED_WORKER_LOG_LEVEL=INFO
 ```
 
@@ -42,6 +42,9 @@ Optional local model settings for the private pipeline endpoints:
 
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
+LOCAL_OLLAMA_EXTRACT_MODEL=qwen3:8b
+LOCAL_OLLAMA_GENERATION_MODEL=qwen3:8b
+LOCAL_OLLAMA_VERIFIER_MODEL=deepseek-r1:8b
 LOCAL_OLLAMA_MODEL=qwen3:8b
 OLLAMA_EMBED_MODEL=nomic-embed-text
 OLLAMA_TIMEOUT_SECONDS=120
@@ -53,6 +56,11 @@ UNIFIED_WORKER_USE_OLLAMA_VERIFIER=1
 FASTEMBED_MODEL=BAAI/bge-small-en-v1.5
 UNIFIED_WORKER_USE_FASTEMBED_RANKING=0
 ```
+
+Recommended pool layout on one RTX 3060 12GB:
+- fetch workers: `UNIFIED_WORKER_TASK_TYPES=job_fetch`
+- rank workers: `UNIFIED_WORKER_TASK_TYPES=job_rank`
+- GPU LLM worker: `UNIFIED_WORKER_TASK_TYPES=job_extract,tailor_generate,tailor_verify`
 
 Current provider behavior:
 - extraction can use Ollama JSON prompting with heuristic fallback

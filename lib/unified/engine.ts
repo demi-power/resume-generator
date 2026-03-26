@@ -415,3 +415,104 @@ export function verifyTailoredPatch(baseDocument: ImportedResumeDocument, patch:
 export function buildTailoredResume(baseDocument: ImportedResumeDocument, patch: ResumePatch): ResumeData {
   return applyResumePatchToResumeData(baseDocument.resumeData, patch);
 }
+
+export function buildInteractiveTailorGenerationPrompt(
+  baseDocument: ImportedResumeDocument,
+  jobProfile: JobProfile,
+  match: RankedResumeCandidate,
+  revision?: {
+    previousPatch?: ResumePatch | null;
+    verifier?: VerifierResult | null;
+    attempt?: number | null;
+    maxAttempts?: number | null;
+  }
+): string {
+  const promptParts = [
+    "You are tailoring a resume for a job application.",
+    "Use only facts supported by the source resume.",
+    "Do not invent employers, titles, dates, metrics, or technologies not already present in the source resume.",
+    "Return JSON only. No markdown fences. No commentary. No analysis. No chain-of-thought.",
+    "The first character of your reply must be { and the last character must be }.",
+    "If the source resume does not support a requirement, record that only inside coverageNotes.",
+    "",
+    "JSON schema:",
+    JSON.stringify(
+      {
+        summary: "string",
+        skillsOrder: ["string"],
+        experienceEdits: [{ experienceId: "string", originalText: "string", tailoredText: "string" }],
+        removedItems: ["string"],
+        coverageNotes: ["string"],
+        providerMetadata: { effective_provider: "deepseek_webview" },
+      },
+      null,
+      2
+    ),
+    "",
+    "Job profile:",
+    JSON.stringify(jobProfile, null, 2),
+    "",
+    "Ranked match:",
+    JSON.stringify(match, null, 2),
+    "",
+    "Source resume:",
+    JSON.stringify(baseDocument.resumeData, null, 2),
+  ];
+  if (revision?.previousPatch) {
+    promptParts.push(
+      "",
+      "Revision context:",
+      `This is revision attempt ${(revision.attempt ?? 1) + 1} of ${revision.maxAttempts ?? 1}.`,
+      "Revise the previous patch instead of starting from scratch.",
+      "Previous patch:",
+      JSON.stringify(revision.previousPatch, null, 2)
+    );
+  }
+  if (revision?.verifier) {
+    promptParts.push(
+      "",
+      "Verifier feedback from the previous attempt:",
+      JSON.stringify(revision.verifier, null, 2),
+      "Fix every verifier violation while staying grounded in the source resume."
+    );
+  }
+  return promptParts.join("\n");
+}
+
+export function buildInteractiveVerifierPrompt(
+  baseDocument: ImportedResumeDocument,
+  jobProfile: JobProfile,
+  patch: ResumePatch
+): string {
+  return [
+    "You are verifying a tailored resume patch.",
+    "Reject unsupported claims, invented metrics, invented tools, missing critical requirements, formatting violations, or obvious keyword stuffing.",
+    "Use only the source resume and the provided patch.",
+    "Return JSON only. No markdown fences. No commentary. No analysis. No chain-of-thought.",
+    "The first character of your reply must be { and the last character must be }.",
+    "If the patch is invalid, explain that only inside violations, retryInstructions, and humanReviewReason.",
+    "",
+    "JSON schema:",
+    JSON.stringify(
+      {
+        pass: true,
+        violations: [{ type: "unsupported_claim", message: "string" }],
+        retryInstructions: ["string"],
+        qualityScore: 0.75,
+        humanReviewReason: "string or null",
+        providerMetadata: { effective_provider: "chatgpt_webview" },
+      },
+      null,
+      2
+    ),
+    "",
+    "Job profile:",
+    JSON.stringify(jobProfile, null, 2),
+    "",
+    "Source resume:",
+    JSON.stringify(baseDocument.resumeData, null, 2),
+    "",
+    "Tailored patch:",
+    JSON.stringify(patch, null, 2),
+  ].join("\n");
+}

@@ -1,6 +1,16 @@
 import { NextResponse } from "next/server";
 import { listJobApplications, createJobApplication } from "@/lib/db";
+import { getUnifiedJobSummary } from "@/lib/unified/store";
 import { requireActiveUser } from "@/lib/auth";
+
+function withUnifiedJob(row: Record<string, unknown>) {
+  const unifiedJobId = typeof row.unified_job_id === "string" ? row.unified_job_id.trim() : "";
+  if (!unifiedJobId) return row;
+  return {
+    ...row,
+    unifiedJob: getUnifiedJobSummary(unifiedJobId) ?? null,
+  };
+}
 
 export async function GET(request: Request) {
   try {
@@ -16,7 +26,7 @@ export async function GET(request: Request) {
       return NextResponse.json([], { status: 200 });
     }
     const rows = listJobApplications(profileId);
-    return NextResponse.json(rows);
+    return NextResponse.json(rows.map((row) => withUnifiedJob(row as unknown as Record<string, unknown>)));
   } catch (e) {
     console.error(e);
     return NextResponse.json(
@@ -72,7 +82,7 @@ export async function POST(request: Request) {
       applied_manually,
       gpt_chat_url,
     });
-    return NextResponse.json(row);
+    return NextResponse.json(withUnifiedJob(row as unknown as Record<string, unknown>));
   } catch (e) {
     console.error(e);
     return NextResponse.json(

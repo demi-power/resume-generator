@@ -3,6 +3,7 @@ import path from "path";
 import Database from "better-sqlite3";
 import type { ResumeData } from "./resume-store";
 import { normalizeCompanyForDuplicateKey } from "./normalize-company";
+import { canonicalizeJobUrl } from "./unified/utils";
 
 export const DATA_DIR = path.join(process.cwd(), "data");
 export const DB_PATH = path.join(DATA_DIR, "app.db");
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS job_applications (
   company_name TEXT NOT NULL,
   title TEXT NOT NULL,
   job_url TEXT,
+  unified_job_id TEXT,
   profile_id TEXT,
   resume_file_name TEXT NOT NULL,
   job_description TEXT NOT NULL,
@@ -95,6 +97,18 @@ CREATE TABLE IF NOT EXISTS users (
       db.exec("ALTER TABLE job_applications ADD COLUMN last_resume_download_at TEXT");
     }
   } catch (_) {}
+  // Migration: link legacy job_applications rows to unified pipeline jobs
+  try {
+    const info = db
+      .prepare<unknown[], { name: string }>(
+        "SELECT name FROM pragma_table_info('job_applications') WHERE name = 'unified_job_id'"
+      )
+      .get();
+    if (!info) {
+      db.exec("ALTER TABLE job_applications ADD COLUMN unified_job_id TEXT");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_job_applications_unified_job_id ON job_applications(unified_job_id)");
+  } catch (_) {}
 
 function genId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -124,9 +138,11 @@ export function setActiveProfileId(activeProfileId: string | null): void {
 // --- DeepSeek session cookies (shared; full Electron cookie objects) ---
 
 const DEEPSEEK_COOKIES_KEY = "deepseek_cookies";
+const CHATGPT_COOKIES_KEY = "chatgpt_cookies";
 
 /** Full cookie object as returned by Electron session.cookies.get(). */
 export type DeepSeekCookie = Record<string, unknown>;
+export type ChatGptCookie = Record<string, unknown>;
 
 export function getDeepSeekCookies(): DeepSeekCookie[] {
   const row = db
@@ -144,6 +160,24 @@ export function getDeepSeekCookies(): DeepSeekCookie[] {
 export function setDeepSeekCookies(cookies: DeepSeekCookie[]): void {
   const value = JSON.stringify(Array.isArray(cookies) ? cookies : []);
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(DEEPSEEK_COOKIES_KEY, value);
+}
+
+export function getChatGptCookies(): ChatGptCookie[] {
+  const row = db
+    .prepare<unknown[], { value: string }>("SELECT value FROM settings WHERE key = ?")
+    .get(CHATGPT_COOKIES_KEY);
+  if (!row?.value) return [];
+  try {
+    const parsed = JSON.parse(row.value) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function setChatGptCookies(cookies: ChatGptCookie[]): void {
+  const value = JSON.stringify(Array.isArray(cookies) ? cookies : []);
+  db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(CHATGPT_COOKIES_KEY, value);
 }
 
 // --- Profiles ---
@@ -271,6 +305,7 @@ export interface JobApplicationRow {
   company_name: string;
   title: string;
   job_url: string | null;
+  unified_job_id: string | null;
   profile_id: string | null;
   resume_file_name: string;
   job_description: string;
@@ -292,7 +327,7 @@ function slug(s: string): string {
 /** Returns job applications in storage order. If profileId is provided, only rows for that profile. */
 export function listJobApplications(profileId?: string | null): JobApplicationRow[] {
   const cols =
-    "id, date, company_name, title, job_url, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at";
+    "id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at";
   const order = " ORDER BY rowid ASC";
   if (profileId != null && String(profileId).trim() !== "") {
     const rows = db
@@ -304,6 +339,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
           company_name: string;
           title: string;
           job_url: string | null;
+          unified_job_id: string | null;
           profile_id: string | null;
           resume_file_name: string;
           job_description: string;
@@ -325,6 +361,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
         company_name: string;
         title: string;
         job_url: string | null;
+        unified_job_id: string | null;
         profile_id: string | null;
         resume_file_name: string;
         job_description: string;
@@ -372,6 +409,7 @@ export function getJobApplication(id: string): JobApplicationRow | undefined {
         company_name: string;
         title: string;
         job_url: string | null;
+        unified_job_id: string | null;
         profile_id: string | null;
         resume_file_name: string;
         job_description: string;
@@ -381,10 +419,48 @@ export function getJobApplication(id: string): JobApplicationRow | undefined {
         created_at: string;
       }
     >(
-      "SELECT id, date, company_name, title, job_url, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE id = ?"
+      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE id = ?"
     )
     .get(id);
   return row ?? undefined;
+}
+
+export function getJobApplicationByUnifiedJobId(unifiedJobId: string): JobApplicationRow | undefined {
+  const trimmed = unifiedJobId.trim();
+  if (!trimmed) return undefined;
+  const row = db
+    .prepare<
+      [string],
+      {
+        id: string;
+        date: string;
+        company_name: string;
+        title: string;
+        job_url: string | null;
+        unified_job_id: string | null;
+        profile_id: string | null;
+        resume_file_name: string;
+        job_description: string;
+        applied_manually: number;
+        gpt_chat_url: string | null;
+        last_resume_download_at: string | null;
+        created_at: string;
+      }
+    >(
+      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE unified_job_id = ? ORDER BY rowid ASC LIMIT 1"
+    )
+    .get(trimmed);
+  return row ?? undefined;
+}
+
+export function findJobApplicationByCanonicalJobUrl(jobUrl: string): JobApplicationRow | undefined {
+  const canonical = canonicalizeJobUrl(jobUrl)?.canonicalUrl;
+  if (!canonical) return undefined;
+  const rows = listJobApplications();
+  return rows.find((row) => {
+    if (!row.job_url) return false;
+    return canonicalizeJobUrl(row.job_url)?.canonicalUrl === canonical;
+  });
 }
 
 export function createJobApplication(params: {
@@ -392,6 +468,7 @@ export function createJobApplication(params: {
   company_name: string;
   title: string;
   job_url?: string | null;
+  unified_job_id?: string | null;
   profile_id?: string | null;
   resume_file_name?: string | null;
   job_description?: string | null;
@@ -425,6 +502,7 @@ export function createJobApplication(params: {
     company_name: params.company_name.trim(),
     title: params.title.trim(),
     job_url: params.job_url?.trim() || null,
+    unified_job_id: params.unified_job_id?.trim() || null,
     profile_id: params.profile_id ?? null,
     resume_file_name,
     job_description: typeof params.job_description === "string" ? params.job_description : "",
@@ -434,13 +512,14 @@ export function createJobApplication(params: {
     created_at: now,
   };
   db.prepare(
-    "INSERT INTO job_applications (id, date, company_name, title, job_url, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO job_applications (id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     row.id,
     row.date,
     row.company_name,
     row.title,
     row.job_url,
+    row.unified_job_id,
     row.profile_id,
     row.resume_file_name,
     row.job_description,
@@ -459,6 +538,7 @@ export function updateJobApplication(
     company_name?: string;
     title?: string;
     job_url?: string | null;
+    unified_job_id?: string | null;
     profile_id?: string | null;
     resume_file_name?: string | null;
     job_description?: string | null;
@@ -475,6 +555,7 @@ export function updateJobApplication(
     company_name: updates.company_name !== undefined ? updates.company_name.trim() : existing.company_name,
     title: updates.title !== undefined ? updates.title.trim() : existing.title,
     job_url: updates.job_url !== undefined ? updates.job_url?.trim() || null : existing.job_url,
+    unified_job_id: updates.unified_job_id !== undefined ? updates.unified_job_id?.trim() || null : existing.unified_job_id,
     profile_id: updates.profile_id !== undefined ? updates.profile_id : existing.profile_id,
     resume_file_name:
       updates.resume_file_name !== undefined
@@ -508,12 +589,13 @@ export function updateJobApplication(
         : existing.last_resume_download_at ?? null,
   };
   db.prepare(
-    "UPDATE job_applications SET date = ?, company_name = ?, title = ?, job_url = ?, profile_id = ?, resume_file_name = ?, job_description = ?, applied_manually = ?, gpt_chat_url = ?, last_resume_download_at = ? WHERE id = ?"
+    "UPDATE job_applications SET date = ?, company_name = ?, title = ?, job_url = ?, unified_job_id = ?, profile_id = ?, resume_file_name = ?, job_description = ?, applied_manually = ?, gpt_chat_url = ?, last_resume_download_at = ? WHERE id = ?"
   ).run(
     next.date,
     next.company_name,
     next.title,
     next.job_url,
+    next.unified_job_id,
     next.profile_id,
     next.resume_file_name,
     next.job_description,
@@ -522,6 +604,77 @@ export function updateJobApplication(
     next.last_resume_download_at,
     id
   );
+}
+
+export function upsertJobApplicationForUnifiedJob(params: {
+  unified_job_id: string;
+  date?: string;
+  company_name?: string;
+  title?: string;
+  job_url?: string | null;
+  profile_id?: string | null;
+  resume_file_name?: string | null;
+  job_description?: string | null;
+}): JobApplicationRow {
+  const unifiedJobId = params.unified_job_id.trim();
+  if (!unifiedJobId) throw new Error("unified_job_id is required");
+
+  const existing =
+    getJobApplicationByUnifiedJobId(unifiedJobId) ??
+    (params.job_url ? findJobApplicationByCanonicalJobUrl(params.job_url) : undefined);
+
+  if (!existing) {
+    return createJobApplication({
+      date: params.date ?? new Date().toISOString().slice(0, 10),
+      company_name: params.company_name ?? "",
+      title: params.title ?? "",
+      job_url: params.job_url ?? null,
+      unified_job_id: unifiedJobId,
+      profile_id: params.profile_id ?? null,
+      resume_file_name: params.resume_file_name ?? "",
+      job_description: params.job_description ?? "",
+      applied_manually: 0,
+      gpt_chat_url: null,
+    });
+  }
+
+  const updates: Parameters<typeof updateJobApplication>[1] = {
+    unified_job_id: unifiedJobId,
+  };
+  if (!existing.date.trim() && params.date?.trim()) updates.date = params.date.trim();
+  if (!existing.company_name.trim() && params.company_name?.trim()) updates.company_name = params.company_name.trim();
+  if (!existing.title.trim() && params.title?.trim()) updates.title = params.title.trim();
+  if (!existing.job_url?.trim() && params.job_url?.trim()) updates.job_url = params.job_url.trim();
+  if (!existing.profile_id && params.profile_id) updates.profile_id = params.profile_id;
+  if (!existing.resume_file_name.trim() && params.resume_file_name !== undefined) updates.resume_file_name = params.resume_file_name;
+  if (!existing.job_description.trim() && params.job_description?.trim()) updates.job_description = params.job_description;
+  updateJobApplication(existing.id, updates);
+  return getJobApplication(existing.id)!;
+}
+
+export function syncJobApplicationForUnifiedJob(
+  unifiedJobId: string,
+  updates: {
+    company_name?: string;
+    title?: string;
+    job_url?: string | null;
+    job_description?: string | null;
+    resume_file_name?: string | null;
+  }
+): JobApplicationRow | undefined {
+  const existing = getJobApplicationByUnifiedJobId(unifiedJobId);
+  if (!existing) return undefined;
+
+  const next: Parameters<typeof updateJobApplication>[1] = {
+    unified_job_id: unifiedJobId,
+  };
+  if (!existing.company_name.trim() && updates.company_name?.trim()) next.company_name = updates.company_name.trim();
+  if (!existing.title.trim() && updates.title?.trim()) next.title = updates.title.trim();
+  if (!existing.job_url?.trim() && updates.job_url?.trim()) next.job_url = updates.job_url.trim();
+  if (!existing.job_description.trim() && updates.job_description?.trim()) next.job_description = updates.job_description;
+  if (!existing.resume_file_name.trim() && updates.resume_file_name !== undefined) next.resume_file_name = updates.resume_file_name;
+  updateJobApplication(existing.id, next);
+  return getJobApplication(existing.id)!;
 }
 
 export function deleteJobApplication(id: string): void {

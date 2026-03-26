@@ -5,6 +5,12 @@ const os = require("os");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
 
+// The desktop app is webview-heavy and does not need GPU compositing. Disabling
+// hardware acceleration avoids noisy Vulkan init failures on Linux packaging/runtime.
+if (process.platform === "linux") {
+  app.disableHardwareAcceleration();
+}
+
 const DIST_DIR = path.join(__dirname, "..", "dist");
 const PRELOAD_PATH = path.join(__dirname, "preload.js");
 
@@ -578,6 +584,8 @@ ipcMain.handle("save-resume-temp", async (event, { buffer, fileName, profileName
 // DeepSeek shared session: get/set cookies in partition persist:deepseek
 const DEEPSEEK_PARTITION = "persist:deepseek";
 const DEEPSEEK_URL = "https://chat.deepseek.com";
+const CHATGPT_PARTITION = "persist:chatgpt";
+const CHATGPT_URL = "https://chatgpt.com";
 
 ipcMain.handle("write-clipboard-text", (_event, text) => {
   if (typeof text === "string") {
@@ -663,6 +671,38 @@ ipcMain.handle("set-deepseek-cookies", async (_event, cookies) => {
     if (!name) continue;
     await ses.cookies.set({
       url: DEEPSEEK_URL,
+      name,
+      value,
+      path: typeof c.path === "string" ? c.path : "/",
+      domain: typeof c.domain === "string" ? c.domain : undefined,
+      secure: c.secure === true,
+      httpOnly: c.httpOnly === true,
+      expirationDate: typeof c.expirationDate === "number" ? c.expirationDate : undefined,
+      sameSite: c.sameSite,
+    });
+  }
+  return { ok: true };
+});
+
+ipcMain.handle("get-chatgpt-cookies", async () => {
+  const ses = session.fromPartition(CHATGPT_PARTITION);
+  const list = await ses.cookies.get({ url: CHATGPT_URL });
+  return list;
+});
+
+ipcMain.handle("set-chatgpt-cookies", async (_event, cookies) => {
+  const ses = session.fromPartition(CHATGPT_PARTITION);
+  const list = Array.isArray(cookies) ? cookies : [];
+  const existing = await ses.cookies.get({ url: CHATGPT_URL });
+  for (const c of existing) {
+    await ses.cookies.remove(CHATGPT_URL, c.name);
+  }
+  for (const c of list) {
+    const name = c && typeof c.name === "string" ? c.name : null;
+    const value = c && typeof c.value === "string" ? c.value : "";
+    if (!name) continue;
+    await ses.cookies.set({
+      url: CHATGPT_URL,
       name,
       value,
       path: typeof c.path === "string" ? c.path : "/",
