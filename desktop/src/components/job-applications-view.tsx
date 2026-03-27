@@ -58,7 +58,9 @@ interface JobApplication {
   company_name: string;
   title: string;
   job_url: string | null;
+  unified_job_id?: string | null;
   profile_id: string | null;
+  resume_format_id?: string | null;
   resume_file_name: string;
   job_description?: string;
   /** 0 = not applied, 1 = applied */
@@ -66,6 +68,23 @@ interface JobApplication {
   gpt_chat_url?: string | null;
   last_resume_download_at?: string | null;
   created_at: string;
+}
+
+function isFormatId(value: string | null | undefined): value is FormatId {
+  return Boolean(value && FORMAT_LIST.some((item) => item.formatId === value));
+}
+
+function readStoredApplicationFormatId(): FormatId {
+  if (typeof window === "undefined") return "format1";
+  try {
+    const stored = localStorage.getItem("resume-builder-application-modal-template");
+    if (isFormatId(stored)) return stored;
+  } catch {}
+  return "format1";
+}
+
+function getJobApplicationFormatId(app?: JobApplication | null): FormatId {
+  return isFormatId(app?.resume_format_id) ? app.resume_format_id : readStoredApplicationFormatId();
 }
 
 /** In-memory placeholder so a new row can appear at the clicked line (e.g. line 73). Not in DB. */
@@ -95,6 +114,7 @@ function jobAppFieldsDiffer(a: JobApplication, b: JobApplication): boolean {
     (a.title ?? "") !== (b.title ?? "") ||
     (a.job_url ?? "") !== (b.job_url ?? "") ||
     (a.profile_id ?? "") !== (b.profile_id ?? "") ||
+    (a.resume_format_id ?? "") !== (b.resume_format_id ?? "") ||
     (a.resume_file_name ?? "") !== (b.resume_file_name ?? "") ||
     (a.job_description ?? "") !== (b.job_description ?? "") ||
     (a.applied_manually ?? 0) !== (b.applied_manually ?? 0) ||
@@ -109,6 +129,7 @@ function jobAppPatchBody(app: JobApplication): Record<string, unknown> {
     title: app.title ?? "",
     job_url: app.job_url ?? null,
     profile_id: app.profile_id ?? null,
+    resume_format_id: app.resume_format_id ?? "format1",
     resume_file_name: app.resume_file_name ?? null,
     job_description: app.job_description ?? "",
     applied_manually: app.applied_manually ?? 0,
@@ -451,18 +472,25 @@ export function JobApplicationsView() {
   /** Incremented whenever summary/skills/experience change so debounced PDF refresh always runs. */
   /** Resume style (template) chosen in application modal; persisted to localStorage. */
   const APPLICATION_MODAL_TEMPLATE_KEY = "resume-builder-application-modal-template";
-  const [applicationModalFormatId, setApplicationModalFormatId] = useState<FormatId>(() => {
-    if (typeof window === "undefined") return "format1";
-    try {
-      const stored = localStorage.getItem(APPLICATION_MODAL_TEMPLATE_KEY);
-      if (stored && FORMAT_LIST.some((f: { formatId: string }) => f.formatId === stored)) return stored as FormatId;
-    } catch {}
-    return "format1";
-  });
+  const [applicationModalFormatId, setApplicationModalFormatId] = useState<FormatId>(() => readStoredApplicationFormatId());
   const modalResumeDataRef = useRef<ResumeData | null>(null);
   modalResumeDataRef.current = modalResumeData;
   const applicationModalFormatIdRef = useRef<FormatId>(applicationModalFormatId);
   applicationModalFormatIdRef.current = applicationModalFormatId;
+  const persistApplicationResumeFormat = useCallback(async (appId: string, formatId: FormatId) => {
+    const res = await fetch(`/api/job-applications/${appId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resume_format_id: formatId }),
+    });
+    if (!res.ok) {
+      throw new Error("Failed to save resume style");
+    }
+    const updated = (await res.json()) as JobApplication;
+    setApplications((prev) => prev.map((app) => (app.id === updated.id ? { ...app, ...updated } : app)));
+    setApplyApplication((prev) => (prev && prev.id === updated.id ? { ...prev, ...updated } : prev));
+    return updated;
+  }, []);
   // Native browser PDF viewer UI can be large; most Chromium-based browsers honor these.
   const [modalContentVersion, setModalContentVersion] = useState(0);
   const pdfPreviewIframeSrc = useMemo(() => {
@@ -1992,6 +2020,14 @@ export function JobApplicationsView() {
     schedulePdfRefreshRef.current();
   }, [addOpen, modalContentVersion]);
 
+  useEffect(() => {
+    if (!addOpen) return;
+    const nextFormatId = getJobApplicationFormatId(applyApplication);
+    if (applicationModalFormatIdRef.current === nextFormatId) return;
+    setApplicationModalFormatId(nextFormatId);
+    applicationModalFormatIdRef.current = nextFormatId;
+  }, [addOpen, applyApplication?.id, applyApplication?.resume_format_id]);
+
   // Auto-generate PDF when modal data finishes loading (no "View PDF" click needed).
   useEffect(() => {
     if (!addOpen) return;
@@ -2039,6 +2075,7 @@ export function JobApplicationsView() {
             title: form.title.trim(),
             job_url: form.job_url.trim() || null,
             profile_id: form.profile_id || null,
+            resume_format_id: applicationModalFormatIdRef.current,
             job_description: form.job_description?.trim() ?? "",
             applied_manually: true,
           }),
@@ -2096,6 +2133,7 @@ export function JobApplicationsView() {
             title: form.title.trim(),
             job_url: form.job_url.trim() || null,
             profile_id: form.profile_id || currentProfileId || null,
+            resume_format_id: applicationModalFormatIdRef.current,
             job_description: form.job_description?.trim() ?? "",
           }),
         });
@@ -3117,7 +3155,7 @@ export function JobApplicationsView() {
         try {
           const stored = await runGptPipelineForApplication(app);
           if (!stored) continue;
-          const templateId = formatIdToTemplateId(applicationModalFormatIdRef.current);
+          const templateId = formatIdToTemplateId(getJobApplicationFormatId(app));
           const pdfRes = await fetch("/api/pdf", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -4268,7 +4306,7 @@ onClick={(ev: React.MouseEvent<HTMLButtonElement>) => {
                       toast.error("Regenerate failed (no content generated)");
                       return;
                     }
-                    const templateId = formatIdToTemplateId(applicationModalFormatIdRef.current);
+                    const templateId = formatIdToTemplateId(getJobApplicationFormatId(app));
                     const pdfRes = await fetch("/api/pdf", {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
@@ -4503,12 +4541,20 @@ onClick={(ev: React.MouseEvent<HTMLButtonElement>) => {
                   <button
                     key={f.formatId}
                     type="button"
-                    onClick={() => {
+                    onClick={async () => {
                       setApplicationModalFormatId(f.formatId);
                       applicationModalFormatIdRef.current = f.formatId;
                       try {
                         localStorage.setItem(APPLICATION_MODAL_TEMPLATE_KEY, f.formatId);
                       } catch {}
+                      if (applyApplication?.id) {
+                        try {
+                          await persistApplicationResumeFormat(applyApplication.id, f.formatId);
+                        } catch (error) {
+                          console.error("Failed to persist application resume style:", error);
+                          toast.error("Failed to save resume style");
+                        }
+                      }
                       runPdfRefreshNowRef.current();
                     }}
                     title={f.name}

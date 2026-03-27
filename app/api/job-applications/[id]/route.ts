@@ -1,22 +1,13 @@
 import { NextResponse } from "next/server";
-import path from "path";
-import fs from "fs";
 import {
   getJobApplication,
   updateJobApplication,
   deleteJobApplication,
 } from "@/lib/db";
-import { getUnifiedJobSummary } from "@/lib/unified/store";
+import { derivePdfBaseUrl } from "@/lib/pdf-render";
+import { getUnifiedJobSummary, updateJobResumeFormat } from "@/lib/unified/store";
 import { requireUser } from "@/lib/auth";
-
-const JOB_PDFS_DIR = path.join(process.cwd(), "data", "job-pdfs");
-
-function deleteJobPdfIfExists(id: string): void {
-  const filePath = path.join(JOB_PDFS_DIR, `${id}.pdf`);
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
-}
+import { deleteJobApplicationPdfIfExists } from "@/lib/job-application-pdf";
 
 function userCanAccessProfile(user: { role: string; assigned_profile_id: string | null }, profileId: string | null): boolean {
   if (user.role === "admin") return true;
@@ -86,6 +77,7 @@ export async function PATCH(
       title?: string;
       job_url?: string | null;
       profile_id?: string | null;
+      resume_format_id?: string | null;
       resume_file_name?: string | null;
       job_description?: string | null;
       applied_manually?: number | boolean;
@@ -103,6 +95,10 @@ export async function PATCH(
         user.role === "admin"
           ? (typeof body.profile_id === "string" ? body.profile_id || null : null)
           : user.assigned_profile_id;
+    if ("resume_format_id" in body) {
+      updates.resume_format_id =
+        typeof body.resume_format_id === "string" ? body.resume_format_id.trim() || "format1" : "format1";
+    }
     if (typeof body.resume_file_name === "string")
       updates.resume_file_name = body.resume_file_name.trim() || null;
     if ("job_description" in body)
@@ -118,6 +114,13 @@ export async function PATCH(
         typeof body.gpt_chat_url === "string" ? body.gpt_chat_url.trim() || null : null;
     }
     updateJobApplication(id, updates);
+    if (updates.resume_format_id && existing.unified_job_id) {
+      await updateJobResumeFormat({
+        jobId: existing.unified_job_id,
+        resumeFormatId: updates.resume_format_id,
+        pdfBaseUrl: derivePdfBaseUrl({ requestUrl: request.url }),
+      });
+    }
     const row = getJobApplication(id)!;
     return NextResponse.json(withUnifiedJob(row as unknown as Record<string, unknown>));
   } catch (e) {
@@ -146,7 +149,7 @@ export async function DELETE(
     if (!userCanAccessProfile(user, existing.profile_id)) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
-    deleteJobPdfIfExists(id);
+    deleteJobApplicationPdfIfExists(id);
     deleteJobApplication(id);
     return NextResponse.json({ ok: true });
   } catch (e) {

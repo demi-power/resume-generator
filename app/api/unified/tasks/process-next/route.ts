@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { derivePdfBaseUrl } from "@/lib/pdf-render";
 import { processNextUnifiedTask } from "@/lib/unified/queue";
 import { requireUnifiedTaskOperator } from "@/lib/unified/route-helpers";
 
@@ -12,7 +13,11 @@ export async function POST(request: Request) {
     taskTypes?: Array<"job_fetch" | "job_extract" | "job_rank" | "tailor_generate" | "tailor_verify">;
   };
   const workerId = body.workerId?.trim() || (operator.kind === "worker" ? operator.id : "inline-" + operator.user.id);
-  const result = await processNextUnifiedTask({ workerId, taskTypes: body.taskTypes });
+  const result = await processNextUnifiedTask({
+    workerId,
+    taskTypes: body.taskTypes,
+    payload: { pdfBaseUrl: derivePdfBaseUrl({ requestUrl: request.url }) },
+  });
   if (!result) {
     return NextResponse.json({ item: null, processed: false });
   }

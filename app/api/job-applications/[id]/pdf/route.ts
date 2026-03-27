@@ -1,21 +1,7 @@
 import { NextResponse } from "next/server";
-import path from "path";
-import fs from "fs";
 import { getJobApplication, updateJobApplication } from "@/lib/db";
+import { readJobApplicationPdf, saveJobApplicationPdf } from "@/lib/job-application-pdf";
 import { requireUser } from "@/lib/auth";
-
-const JOB_PDFS_DIR = path.join(process.cwd(), "data", "job-pdfs");
-
-function ensureJobPdfDir() {
-  if (!fs.existsSync(JOB_PDFS_DIR)) {
-    fs.mkdirSync(JOB_PDFS_DIR, { recursive: true });
-  }
-}
-
-function getPdfPath(id: string) {
-  ensureJobPdfDir();
-  return path.join(JOB_PDFS_DIR, `${id}.pdf`);
-}
 
 function userCanAccessProfile(user: { role: string; assigned_profile_id: string | null }, profileId: string | null): boolean {
   if (user.role === "admin") return true;
@@ -39,8 +25,8 @@ export async function GET(
     if (!userCanAccessProfile(user, row.profile_id)) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
-    const filePath = getPdfPath(id);
-    if (!fs.existsSync(filePath)) {
+    const pdf = readJobApplicationPdf(id);
+    if (!pdf) {
       return NextResponse.json({ error: "PDF not found for this application" }, { status: 404 });
     }
     try {
@@ -49,9 +35,8 @@ export async function GET(
     } catch (e) {
       console.error("Failed to update last_resume_download_at on download", e);
     }
-    const pdf = fs.readFileSync(filePath);
     const fileName = row.resume_file_name || "resume.pdf";
-    return new NextResponse(pdf, {
+    return new NextResponse(new Uint8Array(pdf), {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
@@ -88,9 +73,10 @@ export async function POST(
     if (!buffer || buffer.byteLength === 0) {
       return NextResponse.json({ error: "Empty PDF body" }, { status: 400 });
     }
-    const filePath = getPdfPath(id);
-    fs.writeFileSync(filePath, Buffer.from(buffer));
-    updateJobApplication(id, { resume_file_name: "resume.pdf" });
+    saveJobApplicationPdf(id, buffer);
+    if (!row.resume_file_name.trim()) {
+      updateJobApplication(id, { resume_file_name: "resume.pdf" });
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -100,4 +86,3 @@ export async function POST(
     );
   }
 }
-

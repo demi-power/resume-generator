@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { listJobApplications, createJobApplication } from "@/lib/db";
+import { updateJobResumeFormat } from "@/lib/unified/store";
+import { derivePdfBaseUrl } from "@/lib/pdf-render";
 import { getUnifiedJobSummary } from "@/lib/unified/store";
 import { requireActiveUser } from "@/lib/auth";
 
@@ -63,6 +65,8 @@ export async function POST(request: Request) {
     // Allow explicit "" so new row has empty resume file cell (no auto-fill).
     const resume_file_name =
       typeof body.resume_file_name === "string" ? body.resume_file_name.trim() : null;
+    const resume_format_id =
+      typeof body.resume_format_id === "string" ? body.resume_format_id.trim() || "format1" : "format1";
     const job_description =
       typeof body.job_description === "string" ? body.job_description : "";
     const applied_manually =
@@ -76,12 +80,21 @@ export async function POST(request: Request) {
       company_name,
       title,
       job_url,
+      unified_job_id: typeof body.unified_job_id === "string" ? body.unified_job_id.trim() || null : null,
       profile_id,
+      resume_format_id,
       resume_file_name,
       job_description,
       applied_manually,
       gpt_chat_url,
     });
+    if (typeof body.unified_job_id === "string" && body.unified_job_id.trim()) {
+      await updateJobResumeFormat({
+        jobId: body.unified_job_id.trim(),
+        resumeFormatId: resume_format_id,
+        pdfBaseUrl: derivePdfBaseUrl({ requestUrl: request.url }),
+      });
+    }
     return NextResponse.json(withUnifiedJob(row as unknown as Record<string, unknown>));
   } catch (e) {
     console.error(e);

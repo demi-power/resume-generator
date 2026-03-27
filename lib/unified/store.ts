@@ -1,9 +1,15 @@
 import {
+  buildJobApplicationResumeFileName,
   getJobApplicationByUnifiedJobId,
+  getProfile,
   rawDb,
   syncJobApplicationForUnifiedJob,
+  updateJobApplication,
   upsertJobApplicationForUnifiedJob,
 } from "@/lib/db";
+import { saveJobApplicationPdf } from "@/lib/job-application-pdf";
+import { derivePdfBaseUrl, renderResumePdfFromFormat } from "@/lib/pdf-render";
+import { formatIdToTemplateId } from "@/lib/template-style-file";
 import {
   buildInteractiveTailorGenerationPrompt,
   buildInteractiveVerifierPrompt,
@@ -16,7 +22,6 @@ import {
 } from "@/lib/unified/engine";
 import { extractJobProfileFromWorker, generateTailoredPatchFromWorker, rankResumeDocumentsFromWorker, verifyTailoredPatchFromWorker } from "@/lib/unified/worker-client";
 import { parseImportedResumeHtml } from "@/lib/unified/resume-parser";
-import { renderResumeDataToHtml, renderResumePdfBuffer } from "@/lib/unified/render";
 import { readUnifiedArtifact, readUnifiedArtifactText, writeStagingHtml, writeUnifiedArtifact } from "@/lib/unified/storage";
 import type {
   GenerationProviderId,
@@ -226,6 +231,9 @@ function ensureStoreColumn(tableName: string, columnName: string, definition: st
 ensureStoreColumn("tailor_tasks", "verifier_provider", "TEXT NOT NULL DEFAULT 'local_ollama'");
 ensureStoreColumn("tailor_tasks", "verifier_claimed_by", "TEXT");
 ensureStoreColumn("tailor_tasks", "verifier_chat_url", "TEXT");
+ensureStoreColumn("jobs", "resume_format_id", "TEXT NOT NULL DEFAULT 'format1'");
+ensureStoreColumn("jobs", "published_snapshot_id", "TEXT");
+ensureStoreColumn("jobs", "published_at", "TEXT");
 
 interface VariantRow {
   id: string;
@@ -272,9 +280,44 @@ function getJob(id: string): Record<string, unknown> | undefined {
   return rawDb.prepare("SELECT * FROM jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
 }
 
+function normalizeResumeFormatId(value: string | null | undefined): string {
+  return formatIdToTemplateId(value ?? "") ? String(value) : "format1";
+}
+
+function updateJobPresentation(jobId: string, updates: {
+  resumeFormatId?: string | null;
+  publishedSnapshotId?: string | null;
+  publishedAt?: string | null;
+}): void {
+  rawDb.prepare(
+    "UPDATE jobs SET resume_format_id = COALESCE(?, resume_format_id), published_snapshot_id = ?, published_at = ?, updated_at = ? WHERE id = ?"
+  ).run(
+    updates.resumeFormatId != null ? normalizeResumeFormatId(updates.resumeFormatId) : null,
+    updates.publishedSnapshotId ?? null,
+    updates.publishedAt ?? null,
+    nowIso(),
+    jobId
+  );
+}
+
 function getLinkedApplication(jobId: string): Record<string, unknown> | null {
   const application = getJobApplicationByUnifiedJobId(jobId);
   return application ? ({ ...application } as unknown as Record<string, unknown>) : null;
+}
+
+function getResumeDataForSnapshot(snapshot: SnapshotRow): ImportedResumeDocument["resumeData"] {
+  const structured = safeJsonParse(snapshot.structured_json, {} as ImportedResumeDocument & { resumeData?: ImportedResumeDocument["resumeData"] });
+  if (structured.resumeData) return structured.resumeData;
+  return safeJsonParse(snapshot.text_content, {} as ImportedResumeDocument["resumeData"]);
+}
+
+function getPublishedPdfArtifact(snapshotId: string | null | undefined): Record<string, unknown> | null {
+  if (!snapshotId) return null;
+  return (
+    rawDb.prepare(
+      "SELECT * FROM artifact_records WHERE owner_type = 'resume_snapshot' AND owner_id = ? AND artifact_kind = 'resume_pdf' ORDER BY created_at DESC LIMIT 1"
+    ).get(snapshotId) as Record<string, unknown> | undefined
+  ) ?? null;
 }
 
 function getLatestMatchRun(jobId: string): Record<string, unknown> | undefined {
@@ -367,30 +410,107 @@ function persistTailoredSnapshot(params: {
     now,
     now
   );
-  const html = renderResumeDataToHtml(tailoredResume, {
-    heading: params.jobProfile.company || "Tailored Resume",
-    subheading: params.jobProfile.title,
-  });
   const basePath = ["workspace", "default", "jobs", params.jobId, "tailored", snapshotId];
   const resumeArtifact = writeUnifiedArtifact(basePath, "resume.json", JSON.stringify(tailoredResume, null, 2));
   const patchArtifact = writeUnifiedArtifact(basePath, "resume_patch.json", JSON.stringify(params.patch, null, 2));
-  const htmlArtifact = writeUnifiedArtifact(basePath, "resume.html", html);
   const jobArtifact = writeUnifiedArtifact(basePath, "job.json", JSON.stringify(params.jobProfile, null, 2));
   const matchArtifact = writeUnifiedArtifact(basePath, "match.json", JSON.stringify(params.match, null, 2));
   const verifyArtifact = writeUnifiedArtifact(basePath, "verify.json", JSON.stringify(params.verifier, null, 2));
   insertArtifact("resume_snapshot", snapshotId, "resume_json", resumeArtifact.relativePath, "application/json", resumeArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "resume_patch_json", patchArtifact.relativePath, "application/json", patchArtifact.sizeBytes);
-  insertArtifact("resume_snapshot", snapshotId, "resume_html", htmlArtifact.relativePath, "text/html", htmlArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "job_json", jobArtifact.relativePath, "application/json", jobArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "match_json", matchArtifact.relativePath, "application/json", matchArtifact.sizeBytes);
   insertArtifact("resume_snapshot", snapshotId, "verify_json", verifyArtifact.relativePath, "application/json", verifyArtifact.sizeBytes);
   return snapshotId;
 }
 
-async function persistTailoredPdf(snapshotId: string, jobId: string, resumeHtml: string): Promise<void> {
-  const pdfBuffer = await renderResumePdfBuffer(resumeHtml);
-  const artifact = writeUnifiedArtifact(["workspace", "default", "jobs", jobId, "tailored", snapshotId], "resume.pdf", pdfBuffer);
-  insertArtifact("resume_snapshot", snapshotId, "resume_pdf", artifact.relativePath, "application/pdf", artifact.sizeBytes);
+async function publishTailoredSnapshotForJob(params: {
+  jobId: string;
+  snapshotId: string;
+  pdfBaseUrl?: string | null;
+  resumeFormatId?: string | null;
+}): Promise<{
+  resumeFormatId: string;
+  linkedApplication: Record<string, unknown>;
+  pdfArtifact: Record<string, unknown> | null;
+}> {
+  const job = getJob(params.jobId);
+  if (!job) throw new Error("Job not found");
+  const snapshot = getSnapshot(params.snapshotId);
+  if (!snapshot) throw new Error("Tailored snapshot not found");
+  const resumeFormatId = normalizeResumeFormatId(params.resumeFormatId ?? String(job.resume_format_id || "format1"));
+  const linkedApplication =
+    syncJobApplicationForUnifiedJob(params.jobId, {
+      company_name: String(job.company || ""),
+      title: String(job.title || ""),
+      job_url: String(job.raw_url || job.canonical_url || ""),
+      job_description: String(job.description_text || ""),
+      resume_format_id: resumeFormatId,
+    }) ??
+    upsertJobApplicationForUnifiedJob({
+      unified_job_id: params.jobId,
+      date: nowIso().slice(0, 10),
+      company_name: String(job.company || ""),
+      title: String(job.title || ""),
+      job_url: String(job.raw_url || job.canonical_url || ""),
+      job_description: String(job.description_text || ""),
+      resume_format_id: resumeFormatId,
+    });
+  if (!linkedApplication) throw new Error("Failed to link application for publish");
+
+  const resumeData = getResumeDataForSnapshot(snapshot);
+  const renderResult = await renderResumePdfFromFormat({
+    data: resumeData,
+    formatId: resumeFormatId,
+    baseUrl: derivePdfBaseUrl({ baseUrl: params.pdfBaseUrl ?? null }),
+  });
+
+  saveJobApplicationPdf(String(linkedApplication.id), renderResult.pdfBuffer);
+  const profileName =
+    linkedApplication.profile_id && typeof linkedApplication.profile_id === "string"
+      ? getProfile(linkedApplication.profile_id)?.name ?? null
+      : null;
+  const fileName = buildJobApplicationResumeFileName({
+    profileName,
+    companyName: String(linkedApplication.company_name || job.company || ""),
+    title: String(linkedApplication.title || job.title || ""),
+    date: String(linkedApplication.date || nowIso().slice(0, 10)),
+    formatId: resumeFormatId,
+  });
+  updateJobApplication(String(linkedApplication.id), {
+    resume_file_name: fileName,
+    resume_format_id: resumeFormatId,
+  });
+
+  const basePath = ["workspace", "default", "jobs", params.jobId, "tailored", params.snapshotId];
+  const pdfArtifact = writeUnifiedArtifact(basePath, "resume.pdf", renderResult.pdfBuffer);
+  replaceArtifactRecord("resume_snapshot", params.snapshotId, "resume_pdf", pdfArtifact.relativePath, "application/pdf", pdfArtifact.sizeBytes);
+  const presentationPayload = {
+    resume_format_id: resumeFormatId,
+    templateId: renderResult.templateId,
+    style: renderResult.effectiveStyle,
+  };
+  const presentationArtifact = writeUnifiedArtifact(basePath, "presentation.json", JSON.stringify(presentationPayload, null, 2));
+  replaceArtifactRecord(
+    "resume_snapshot",
+    params.snapshotId,
+    "presentation_json",
+    presentationArtifact.relativePath,
+    "application/json",
+    presentationArtifact.sizeBytes,
+    presentationPayload
+  );
+  const publishedAt = nowIso();
+  updateJobPresentation(params.jobId, {
+    resumeFormatId,
+    publishedSnapshotId: params.snapshotId,
+    publishedAt,
+  });
+  return {
+    resumeFormatId,
+    linkedApplication: (getLinkedApplication(params.jobId) ?? linkedApplication) as unknown as Record<string, unknown>,
+    pdfArtifact: getPublishedPdfArtifact(params.snapshotId),
+  };
 }
 
 export function prepareResumeSync(params: {
@@ -680,6 +800,7 @@ export function createJobsFromUrls(params: {
         title: String(existingJob.title || entry.titleHint || ""),
         job_url: String(existingJob.raw_url || existingJob.canonical_url || normalized.rawUrl),
         job_description: String(existingJob.description_text || ""),
+        resume_format_id: normalizeResumeFormatId(String(existingJob.resume_format_id || "format1")),
       });
       rawDb.prepare(
         "INSERT INTO job_intake_items (id, submitted_by, source_type, raw_url, canonical_url, title_hint, company_hint, batch_id, status, error_code, error_message, existing_job_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'deduped', NULL, NULL, ?, ?, ?)"
@@ -696,7 +817,7 @@ export function createJobsFromUrls(params: {
     ).run(intakeId, params.submittedBy ?? null, params.sourceType, normalized.rawUrl, normalized.canonicalUrl, entry.titleHint ?? null, entry.companyHint ?? null, entry.batchId ?? null, now, now);
     const jobId = createId();
     rawDb.prepare(
-      "INSERT INTO jobs (id, intake_item_id, status, processing_stage, raw_url, canonical_url, title, company, location, work_model, seniority, description_text, fetch_method, error_code, error_message, job_profile_json, created_at, updated_at) VALUES (?, ?, 'queued', 'queued_fetch', ?, ?, ?, ?, '', '', '', '', NULL, NULL, NULL, '{}', ?, ?)"
+      "INSERT INTO jobs (id, intake_item_id, status, processing_stage, raw_url, canonical_url, title, company, location, work_model, seniority, description_text, fetch_method, error_code, error_message, job_profile_json, resume_format_id, published_snapshot_id, published_at, created_at, updated_at) VALUES (?, ?, 'queued', 'queued_fetch', ?, ?, ?, ?, '', '', '', '', NULL, NULL, NULL, '{}', 'format1', NULL, NULL, ?, ?)"
     ).run(jobId, intakeId, normalized.rawUrl, normalized.canonicalUrl, entry.titleHint ?? null, entry.companyHint ?? null, now, now);
     upsertJobApplicationForUnifiedJob({
       unified_job_id: jobId,
@@ -705,6 +826,7 @@ export function createJobsFromUrls(params: {
       title: entry.titleHint ?? "",
       job_url: normalized.rawUrl,
       job_description: "",
+      resume_format_id: "format1",
     });
     const jobRecord = getJob(jobId);
     if (jobRecord) {
@@ -725,12 +847,14 @@ export function getUnifiedJobSummary(jobId: string): Record<string, unknown> | u
   const latestMatchRun = getLatestMatchRun(jobId);
   const latestTailorTask = rawDb.prepare("SELECT * FROM tailor_tasks WHERE job_id = ? ORDER BY created_at DESC LIMIT 1").get(jobId) as Record<string, unknown> | undefined;
   const latestVerifierResult = getVerifierResult((latestTailorTask?.verifier_result_id as string | null | undefined) ?? null);
+  const publishedSnapshotId = job.published_snapshot_id ? String(job.published_snapshot_id) : null;
   return {
     ...job,
     batchId: intakeItem?.batch_id ?? null,
     latestMatchRun: latestMatchRun ?? null,
     latestTailorTask: latestTailorTask ?? null,
     latestVerifierResult: latestVerifierResult ?? null,
+    publishedPdfArtifact: getPublishedPdfArtifact(publishedSnapshotId),
     linkedApplication: getLinkedApplication(jobId),
   };
 }
@@ -750,6 +874,8 @@ export function getJobStatus(jobId: string): Record<string, unknown> | undefined
   const latestTailoredArtifacts = latestTailorTask?.tailored_snapshot_id
     ? getTailoredArtifacts(String(latestTailorTask.tailored_snapshot_id))
     : [];
+  const publishedSnapshotId = summary.published_snapshot_id ? String(summary.published_snapshot_id) : null;
+  const publishedArtifacts = publishedSnapshotId ? getTailoredArtifacts(publishedSnapshotId) : [];
   return {
     ...summary,
     intakeItem,
@@ -761,6 +887,8 @@ export function getJobStatus(jobId: string): Record<string, unknown> | undefined
     matchResults,
     unifiedTasks,
     jobArtifacts,
+    publishedArtifacts,
+    publishedPdfArtifact: getPublishedPdfArtifact(publishedSnapshotId),
     artifacts: latestTailoredArtifacts,
   };
 }
@@ -790,6 +918,33 @@ export function listJobs(filters: { batchId?: string | null; status?: string | n
       linkedApplication: getLinkedApplication(String(job.id)),
     };
   });
+}
+
+export async function updateJobResumeFormat(params: {
+  jobId: string;
+  resumeFormatId: string;
+  pdfBaseUrl?: string | null;
+}): Promise<Record<string, unknown>> {
+  const job = getJob(params.jobId);
+  if (!job) throw new Error("Job not found");
+  const resumeFormatId = normalizeResumeFormatId(params.resumeFormatId);
+  const publishedSnapshotId = job.published_snapshot_id ? String(job.published_snapshot_id) : null;
+  if (publishedSnapshotId) {
+    await publishTailoredSnapshotForJob({
+      jobId: params.jobId,
+      snapshotId: publishedSnapshotId,
+      pdfBaseUrl: params.pdfBaseUrl ?? null,
+      resumeFormatId,
+    });
+  } else {
+    updateJobPresentation(params.jobId, {
+      resumeFormatId,
+      publishedSnapshotId: null,
+      publishedAt: null,
+    });
+    syncJobApplicationForUnifiedJob(params.jobId, { resume_format_id: resumeFormatId });
+  }
+  return getJobStatus(params.jobId) ?? getUnifiedJobSummary(params.jobId) ?? getJob(params.jobId) ?? {};
 }
 
 export async function ensureJobExtracted(jobId: string): Promise<Record<string, unknown>> {
@@ -1061,6 +1216,7 @@ async function finalizeTailorVerification(params: {
   patch: ResumePatch;
   verifier: VerifierResult;
   verifierChatUrl?: string | null;
+  pdfBaseUrl?: string | null;
 }): Promise<Record<string, unknown>> {
   const verifierId = createVerifierRecord(params.taskId, params.verifier);
   if (params.verifier.pass) {
@@ -1072,16 +1228,29 @@ async function finalizeTailorVerification(params: {
       patch: params.patch,
       verifier: params.verifier,
     });
-    const htmlArtifact = rawDb
-      .prepare("SELECT relative_path FROM artifact_records WHERE owner_type = 'resume_snapshot' AND owner_id = ? AND artifact_kind = 'resume_html' ORDER BY created_at DESC LIMIT 1")
-      .get(tailoredSnapshotId) as { relative_path: string } | undefined;
-    if (htmlArtifact?.relative_path) {
-      await persistTailoredPdf(tailoredSnapshotId, String(params.task.job_id), readUnifiedArtifactText(htmlArtifact.relative_path));
+    try {
+      await publishTailoredSnapshotForJob({
+        jobId: String(params.task.job_id),
+        snapshotId: tailoredSnapshotId,
+        pdfBaseUrl: params.pdfBaseUrl ?? null,
+      });
+      rawDb
+        .prepare("UPDATE tailor_tasks SET status = 'completed', verifier_result_id = ?, verifier_chat_url = COALESCE(?, verifier_chat_url), tailored_snapshot_id = ?, updated_at = ? WHERE id = ?")
+        .run(verifierId, params.verifierChatUrl ?? null, tailoredSnapshotId, nowIso(), params.taskId);
+      updateJobStatusAndStage(String(params.task.job_id), "completed", "completed", { errorCode: null, errorMessage: null });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      rawDb
+        .prepare("UPDATE resume_snapshots SET status = 'manual_review_required', updated_at = ? WHERE id = ?")
+        .run(nowIso(), tailoredSnapshotId);
+      rawDb
+        .prepare("UPDATE tailor_tasks SET status = 'manual_review_required', verifier_result_id = ?, verifier_chat_url = COALESCE(?, verifier_chat_url), tailored_snapshot_id = ?, updated_at = ? WHERE id = ?")
+        .run(verifierId, params.verifierChatUrl ?? null, tailoredSnapshotId, nowIso(), params.taskId);
+      updateJobStatusAndStage(String(params.task.job_id), "manual_review_required", "publish_failed", {
+        errorCode: "PUBLISH_FAILED",
+        errorMessage: message,
+      });
     }
-    rawDb
-      .prepare("UPDATE tailor_tasks SET status = 'completed', verifier_result_id = ?, verifier_chat_url = COALESCE(?, verifier_chat_url), tailored_snapshot_id = ?, updated_at = ? WHERE id = ?")
-      .run(verifierId, params.verifierChatUrl ?? null, tailoredSnapshotId, nowIso(), params.taskId);
-    updateJobStatusAndStage(String(params.task.job_id), "completed", "completed", { errorCode: null, errorMessage: null });
   } else {
     const retries = Number(params.task.retries || 0);
     const maxRetries = Number(params.task.max_retries || 0);
@@ -1270,7 +1439,16 @@ export async function runTailorVerifyTask(taskId: string, _payload?: Record<stri
   updateJobStatusAndStage(String(task.job_id), "verifying", "verifying", { errorCode: null, errorMessage: null });
   rawDb.prepare("UPDATE tailor_tasks SET status = 'verifying', updated_at = ? WHERE id = ?").run(nowIso(), taskId);
   const verifier = (await verifyTailoredPatchFromWorker(baseDocument, patch, jobProfile)) ?? verifyTailoredPatch(baseDocument, patch, jobProfile);
-  return await finalizeTailorVerification({ taskId, task, baseSnapshot, jobProfile, match, patch, verifier });
+  return await finalizeTailorVerification({
+    taskId,
+    task,
+    baseSnapshot,
+    jobProfile,
+    match,
+    patch,
+    verifier,
+    pdfBaseUrl: typeof _payload?.pdfBaseUrl === "string" ? _payload.pdfBaseUrl : null,
+  });
 }
 
 export function retryTailorVerifyTask(taskId: string, requestedBy?: string | null): Record<string, unknown> {
@@ -1350,6 +1528,7 @@ export async function submitChatGptVerifierTask(params: {
   taskId: string;
   gptChatUrl?: string | null;
   verifier: VerifierResult;
+  pdfBaseUrl?: string | null;
 }): Promise<Record<string, unknown>> {
   const task = rawDb.prepare("SELECT * FROM tailor_tasks WHERE id = ?").get(params.taskId) as Record<string, unknown> | undefined;
   if (!task) throw new Error("Tailor task not found");
@@ -1379,6 +1558,7 @@ export async function submitChatGptVerifierTask(params: {
     patch,
     verifier: params.verifier,
     verifierChatUrl: params.gptChatUrl ?? null,
+    pdfBaseUrl: params.pdfBaseUrl ?? null,
   });
 }
 

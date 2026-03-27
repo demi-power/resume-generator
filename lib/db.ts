@@ -3,6 +3,7 @@ import path from "path";
 import Database from "better-sqlite3";
 import type { ResumeData } from "./resume-store";
 import { normalizeCompanyForDuplicateKey } from "./normalize-company";
+import { FORMAT_IDS, type FormatId } from "./template-format";
 import { canonicalizeJobUrl } from "./unified/utils";
 
 export const DATA_DIR = path.join(process.cwd(), "data");
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS job_applications (
   job_url TEXT,
   unified_job_id TEXT,
   profile_id TEXT,
+  resume_format_id TEXT NOT NULL DEFAULT 'format1',
   resume_file_name TEXT NOT NULL,
   job_description TEXT NOT NULL,
   applied_manually INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +110,16 @@ CREATE TABLE IF NOT EXISTS users (
       db.exec("ALTER TABLE job_applications ADD COLUMN unified_job_id TEXT");
     }
     db.exec("CREATE INDEX IF NOT EXISTS idx_job_applications_unified_job_id ON job_applications(unified_job_id)");
+  } catch (_) {}
+  try {
+    const info = db
+      .prepare<unknown[], { name: string }>(
+        "SELECT name FROM pragma_table_info('job_applications') WHERE name = 'resume_format_id'"
+      )
+      .get();
+    if (!info) {
+      db.exec("ALTER TABLE job_applications ADD COLUMN resume_format_id TEXT NOT NULL DEFAULT 'format1'");
+    }
   } catch (_) {}
 
 function genId(): string {
@@ -307,6 +319,7 @@ export interface JobApplicationRow {
   job_url: string | null;
   unified_job_id: string | null;
   profile_id: string | null;
+  resume_format_id: FormatId;
   resume_file_name: string;
   job_description: string;
   /** 0 = not applied, 1 = applied */
@@ -314,6 +327,33 @@ export interface JobApplicationRow {
   gpt_chat_url: string | null;
   last_resume_download_at: string | null;
   created_at: string;
+}
+
+function hydrateJobApplicationRow(
+  row:
+    | {
+        id: string;
+        date: string;
+        company_name: string;
+        title: string;
+        job_url: string | null;
+        unified_job_id: string | null;
+        profile_id: string | null;
+        resume_format_id: string;
+        resume_file_name: string;
+        job_description: string;
+        applied_manually: number;
+        gpt_chat_url: string | null;
+        last_resume_download_at: string | null;
+        created_at: string;
+      }
+    | undefined
+): JobApplicationRow | undefined {
+  if (!row) return undefined;
+  return {
+    ...row,
+    resume_format_id: normalizeResumeFormatId(row.resume_format_id),
+  };
 }
 
 function slug(s: string): string {
@@ -324,10 +364,24 @@ function slug(s: string): string {
     .slice(0, 80) || "untitled";
 }
 
+function normalizeResumeFormatId(value: string | null | undefined): FormatId {
+  return FORMAT_IDS.includes(value as FormatId) ? (value as FormatId) : "format1";
+}
+
+export function buildJobApplicationResumeFileName(params: {
+  profileName?: string | null;
+  companyName?: string | null;
+  title?: string | null;
+  date?: string | null;
+  formatId?: string | null;
+}): string {
+  return `${slug(params.profileName ?? "default")}_${slug(params.companyName ?? "")}_${slug(params.title ?? "")}_${(params.date ?? "").trim() || new Date().toISOString().slice(0, 10)}_${normalizeResumeFormatId(params.formatId)}.pdf`;
+}
+
 /** Returns job applications in storage order. If profileId is provided, only rows for that profile. */
 export function listJobApplications(profileId?: string | null): JobApplicationRow[] {
   const cols =
-    "id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at";
+    "id, date, company_name, title, job_url, unified_job_id, profile_id, resume_format_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at";
   const order = " ORDER BY rowid ASC";
   if (profileId != null && String(profileId).trim() !== "") {
     const rows = db
@@ -341,6 +395,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
           job_url: string | null;
           unified_job_id: string | null;
           profile_id: string | null;
+          resume_format_id: string;
           resume_file_name: string;
           job_description: string;
           applied_manually: number;
@@ -350,7 +405,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
         }
       >(`SELECT ${cols} FROM job_applications WHERE profile_id = ?${order}`)
       .all(profileId.trim());
-    return rows;
+    return rows.map((row) => hydrateJobApplicationRow(row)!);
   }
   const rows = db
     .prepare<
@@ -363,6 +418,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
         job_url: string | null;
         unified_job_id: string | null;
         profile_id: string | null;
+        resume_format_id: string;
         resume_file_name: string;
         job_description: string;
         applied_manually: number;
@@ -372,7 +428,7 @@ export function listJobApplications(profileId?: string | null): JobApplicationRo
       }
     >(`SELECT ${cols} FROM job_applications${order}`)
     .all();
-  return rows;
+  return rows.map((row) => hydrateJobApplicationRow(row)!);
 }
 
 /** Keys (profile_id::normalized_company) that appear more than once in job_applications. Used to highlight duplicate rows. */
@@ -411,6 +467,7 @@ export function getJobApplication(id: string): JobApplicationRow | undefined {
         job_url: string | null;
         unified_job_id: string | null;
         profile_id: string | null;
+        resume_format_id: string;
         resume_file_name: string;
         job_description: string;
         applied_manually: number;
@@ -419,10 +476,10 @@ export function getJobApplication(id: string): JobApplicationRow | undefined {
         created_at: string;
       }
     >(
-      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE id = ?"
+      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_format_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE id = ?"
     )
     .get(id);
-  return row ?? undefined;
+  return hydrateJobApplicationRow(row);
 }
 
 export function getJobApplicationByUnifiedJobId(unifiedJobId: string): JobApplicationRow | undefined {
@@ -439,6 +496,7 @@ export function getJobApplicationByUnifiedJobId(unifiedJobId: string): JobApplic
         job_url: string | null;
         unified_job_id: string | null;
         profile_id: string | null;
+        resume_format_id: string;
         resume_file_name: string;
         job_description: string;
         applied_manually: number;
@@ -447,10 +505,10 @@ export function getJobApplicationByUnifiedJobId(unifiedJobId: string): JobApplic
         created_at: string;
       }
     >(
-      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE unified_job_id = ? ORDER BY rowid ASC LIMIT 1"
+      "SELECT id, date, company_name, title, job_url, unified_job_id, profile_id, resume_format_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at FROM job_applications WHERE unified_job_id = ? ORDER BY rowid ASC LIMIT 1"
     )
     .get(trimmed);
-  return row ?? undefined;
+  return hydrateJobApplicationRow(row);
 }
 
 export function findJobApplicationByCanonicalJobUrl(jobUrl: string): JobApplicationRow | undefined {
@@ -470,18 +528,26 @@ export function createJobApplication(params: {
   job_url?: string | null;
   unified_job_id?: string | null;
   profile_id?: string | null;
+  resume_format_id?: string | null;
   resume_file_name?: string | null;
   job_description?: string | null;
   applied_manually?: number | boolean;
   gpt_chat_url?: string | null;
 }): JobApplicationRow {
+  const resumeFormatId = normalizeResumeFormatId(params.resume_format_id);
   let resume_file_name: string;
   if (params.resume_file_name !== undefined && params.resume_file_name !== null) {
     resume_file_name = String(params.resume_file_name).trim();
   } else {
     const profileName =
       params.profile_id != null ? getProfile(params.profile_id)?.name ?? "default" : "default";
-    resume_file_name = `${slug(profileName)}_${slug(params.company_name)}_${slug(params.title)}_${params.date}.pdf`;
+    resume_file_name = buildJobApplicationResumeFileName({
+      profileName,
+      companyName: params.company_name,
+      title: params.title,
+      date: params.date,
+      formatId: resumeFormatId,
+    });
   }
   const now = new Date().toISOString();
   const id = genId();
@@ -504,6 +570,7 @@ export function createJobApplication(params: {
     job_url: params.job_url?.trim() || null,
     unified_job_id: params.unified_job_id?.trim() || null,
     profile_id: params.profile_id ?? null,
+    resume_format_id: resumeFormatId,
     resume_file_name,
     job_description: typeof params.job_description === "string" ? params.job_description : "",
     applied_manually: appliedValue,
@@ -512,7 +579,7 @@ export function createJobApplication(params: {
     created_at: now,
   };
   db.prepare(
-    "INSERT INTO job_applications (id, date, company_name, title, job_url, unified_job_id, profile_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO job_applications (id, date, company_name, title, job_url, unified_job_id, profile_id, resume_format_id, resume_file_name, job_description, applied_manually, gpt_chat_url, last_resume_download_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     row.id,
     row.date,
@@ -521,6 +588,7 @@ export function createJobApplication(params: {
     row.job_url,
     row.unified_job_id,
     row.profile_id,
+    row.resume_format_id,
     row.resume_file_name,
     row.job_description,
     row.applied_manually,
@@ -540,6 +608,7 @@ export function updateJobApplication(
     job_url?: string | null;
     unified_job_id?: string | null;
     profile_id?: string | null;
+    resume_format_id?: string | null;
     resume_file_name?: string | null;
     job_description?: string | null;
     applied_manually?: number | boolean;
@@ -557,6 +626,7 @@ export function updateJobApplication(
     job_url: updates.job_url !== undefined ? updates.job_url?.trim() || null : existing.job_url,
     unified_job_id: updates.unified_job_id !== undefined ? updates.unified_job_id?.trim() || null : existing.unified_job_id,
     profile_id: updates.profile_id !== undefined ? updates.profile_id : existing.profile_id,
+    resume_format_id: updates.resume_format_id !== undefined ? normalizeResumeFormatId(updates.resume_format_id) : existing.resume_format_id,
     resume_file_name:
       updates.resume_file_name !== undefined
         ? updates.resume_file_name != null
@@ -589,7 +659,7 @@ export function updateJobApplication(
         : existing.last_resume_download_at ?? null,
   };
   db.prepare(
-    "UPDATE job_applications SET date = ?, company_name = ?, title = ?, job_url = ?, unified_job_id = ?, profile_id = ?, resume_file_name = ?, job_description = ?, applied_manually = ?, gpt_chat_url = ?, last_resume_download_at = ? WHERE id = ?"
+    "UPDATE job_applications SET date = ?, company_name = ?, title = ?, job_url = ?, unified_job_id = ?, profile_id = ?, resume_format_id = ?, resume_file_name = ?, job_description = ?, applied_manually = ?, gpt_chat_url = ?, last_resume_download_at = ? WHERE id = ?"
   ).run(
     next.date,
     next.company_name,
@@ -597,6 +667,7 @@ export function updateJobApplication(
     next.job_url,
     next.unified_job_id,
     next.profile_id,
+    next.resume_format_id,
     next.resume_file_name,
     next.job_description,
     next.applied_manually,
@@ -613,6 +684,7 @@ export function upsertJobApplicationForUnifiedJob(params: {
   title?: string;
   job_url?: string | null;
   profile_id?: string | null;
+  resume_format_id?: string | null;
   resume_file_name?: string | null;
   job_description?: string | null;
 }): JobApplicationRow {
@@ -631,6 +703,7 @@ export function upsertJobApplicationForUnifiedJob(params: {
       job_url: params.job_url ?? null,
       unified_job_id: unifiedJobId,
       profile_id: params.profile_id ?? null,
+      resume_format_id: params.resume_format_id ?? "format1",
       resume_file_name: params.resume_file_name ?? "",
       job_description: params.job_description ?? "",
       applied_manually: 0,
@@ -646,6 +719,9 @@ export function upsertJobApplicationForUnifiedJob(params: {
   if (!existing.title.trim() && params.title?.trim()) updates.title = params.title.trim();
   if (!existing.job_url?.trim() && params.job_url?.trim()) updates.job_url = params.job_url.trim();
   if (!existing.profile_id && params.profile_id) updates.profile_id = params.profile_id;
+  if (params.resume_format_id !== undefined && normalizeResumeFormatId(params.resume_format_id) !== existing.resume_format_id) {
+    updates.resume_format_id = params.resume_format_id;
+  }
   if (!existing.resume_file_name.trim() && params.resume_file_name !== undefined) updates.resume_file_name = params.resume_file_name;
   if (!existing.job_description.trim() && params.job_description?.trim()) updates.job_description = params.job_description;
   updateJobApplication(existing.id, updates);
@@ -659,6 +735,7 @@ export function syncJobApplicationForUnifiedJob(
     title?: string;
     job_url?: string | null;
     job_description?: string | null;
+    resume_format_id?: string | null;
     resume_file_name?: string | null;
   }
 ): JobApplicationRow | undefined {
@@ -672,6 +749,9 @@ export function syncJobApplicationForUnifiedJob(
   if (!existing.title.trim() && updates.title?.trim()) next.title = updates.title.trim();
   if (!existing.job_url?.trim() && updates.job_url?.trim()) next.job_url = updates.job_url.trim();
   if (!existing.job_description.trim() && updates.job_description?.trim()) next.job_description = updates.job_description;
+  if (updates.resume_format_id !== undefined && normalizeResumeFormatId(updates.resume_format_id) !== existing.resume_format_id) {
+    next.resume_format_id = updates.resume_format_id;
+  }
   if (!existing.resume_file_name.trim() && updates.resume_file_name !== undefined) next.resume_file_name = updates.resume_file_name;
   updateJobApplication(existing.id, next);
   return getJobApplication(existing.id)!;

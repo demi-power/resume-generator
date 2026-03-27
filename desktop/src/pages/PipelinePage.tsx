@@ -9,6 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "../lib/auth-context";
 import { runProviderPrompt, type ProviderAutomationKind, type WebviewLike } from "../lib/provider-automation";
+import { FORMAT_LIST, type FormatId } from "../lib/template-format";
 
 type ResumeSyncManifestFile = {
   relativePath: string;
@@ -149,6 +150,7 @@ type LinkedApplicationRow = {
   job_url?: string | null;
   unified_job_id?: string | null;
   profile_id?: string | null;
+  resume_format_id?: string | null;
   resume_file_name?: string;
   applied_manually?: number;
   created_at?: string;
@@ -167,6 +169,9 @@ type JobRecord = {
   work_model?: string | null;
   seniority?: string | null;
   description_text?: string | null;
+  resume_format_id?: string | null;
+  published_snapshot_id?: string | null;
+  published_at?: string | null;
   fetch_method?: string | null;
   job_profile_json?: string | null;
   error_code?: string | null;
@@ -179,6 +184,8 @@ type JobRecord = {
   unifiedTasks?: UnifiedTaskRow[];
   jobArtifacts?: ArtifactRow[];
   artifacts?: ArtifactRow[];
+  publishedArtifacts?: ArtifactRow[];
+  publishedPdfArtifact?: ArtifactRow | null;
   linkedApplication?: LinkedApplicationRow | null;
 };
 
@@ -216,6 +223,7 @@ type WorkerStatusSnapshot = {
   running?: boolean;
   workerId?: string;
   enabled?: boolean;
+  taskTypes?: string[];
   processedCount?: number;
   idlePollCount?: number;
   lastPollAt?: string | null;
@@ -315,10 +323,33 @@ function mergeJobs(previous: JobRecord[], incoming: JobRecord[]): JobRecord[] {
       unifiedTasks: job.unifiedTasks ?? existing?.unifiedTasks,
       jobArtifacts: job.jobArtifacts ?? existing?.jobArtifacts,
       artifacts: job.artifacts ?? existing?.artifacts,
+      publishedArtifacts: job.publishedArtifacts ?? existing?.publishedArtifacts,
+      publishedPdfArtifact: job.publishedPdfArtifact ?? existing?.publishedPdfArtifact,
       linkedApplication: job.linkedApplication ?? existing?.linkedApplication,
     });
   }
   return Array.from(byId.values()).sort((a, b) => (a.id < b.id ? 1 : -1));
+}
+
+function sortOpenUnifiedTasks(tasks: UnifiedTaskRow[]): UnifiedTaskRow[] {
+  const statusRank: Record<string, number> = {
+    claimed: 0,
+    queued: 1,
+    failed: 2,
+    completed: 3,
+  };
+  return [...tasks].sort((left, right) => {
+    const rankDiff = (statusRank[left.status] ?? 99) - (statusRank[right.status] ?? 99);
+    if (rankDiff !== 0) return rankDiff;
+    const leftTime = Date.parse(left.created_at || "");
+    const rightTime = Date.parse(right.created_at || "");
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && rightTime !== leftTime) return rightTime - leftTime;
+    return (right.id || "").localeCompare(left.id || "");
+  });
+}
+
+function coerceFormatId(value: string | null | undefined): FormatId {
+  return FORMAT_LIST.some((entry) => entry.formatId === value) ? (value as FormatId) : "format1";
 }
 
 function parseJsonArray(value: string | undefined): string[] {
@@ -779,6 +810,7 @@ export function PipelinePage() {
   const claimedChatGptVerifierTaskRef = useRef<TailorTaskRow | null>(null);
   const deepSeekAutoStartedTaskIdRef = useRef<string | null>(null);
   const chatGptAutoStartedTaskIdRef = useRef<string | null>(null);
+  const processNextInFlightRef = useRef(false);
 
   const parsedUrlCount = useMemo(() => {
     return urlsText
@@ -797,6 +829,49 @@ export function PipelinePage() {
   }, [batchJobs, activeBatchId]);
 
   const reviewQueueJobs = useMemo(() => jobs.filter((job) => isVerifierBlocked(job)), [jobs]);
+  const hasQueuedUnifiedTasks = useMemo(() => queueItems.some((task) => task.status === "queued"), [queueItems]);
+  const currentInlineWorkerId = user?.id ? `inline-${user.id}` : null;
+  const queuedTaskTypes = useMemo(
+    () => Array.from(new Set(queueItems.filter((task) => task.status === "queued").map((task) => task.task_type).filter(Boolean))).sort(),
+    [queueItems]
+  );
+  const currentInlineClaimCount = useMemo(
+    () => (currentInlineWorkerId ? queueItems.filter((task) => task.status === "claimed" && task.worker_id === currentInlineWorkerId).length : 0),
+    [currentInlineWorkerId, queueItems]
+  );
+  const hasCurrentInlineClaim = currentInlineClaimCount > 0;
+  const workerRunning = workerStatus?.connected === true && workerStatus?.worker?.running === true;
+  const workerTaskTypes = useMemo(() => {
+    const types = workerStatus?.worker?.taskTypes;
+    return Array.isArray(types) ? types.map((value) => String(value).trim()).filter(Boolean) : [];
+  }, [workerStatus?.worker?.taskTypes]);
+  const workerHasTaskTypeFilter = workerTaskTypes.length > 0;
+  const workerCanProcessQueuedTypes = useMemo(() => {
+    if (!workerRunning) return false;
+    if (!workerHasTaskTypeFilter) return true;
+    return queuedTaskTypes.some((taskType) => workerTaskTypes.includes(taskType));
+  }, [queuedTaskTypes, workerHasTaskTypeFilter, workerRunning, workerTaskTypes]);
+  const workerStalledOnCurrentQueue = useMemo(() => {
+    if (!workerRunning || !hasQueuedUnifiedTasks) return false;
+    const idlePolls = workerStatus?.worker?.idlePollCount ?? 0;
+    if (idlePolls < 3) return false;
+    const oldestQueuedAt = queueItems
+      .filter((task) => task.status === "queued")
+      .map((task) => Date.parse(task.created_at || ""))
+      .filter((value) => Number.isFinite(value))
+      .sort((left, right) => left - right)[0];
+    if (!Number.isFinite(oldestQueuedAt)) return false;
+    const lastProcessedAt = Date.parse(workerStatus?.worker?.lastProcessedAt || "");
+    return !Number.isFinite(lastProcessedAt) || lastProcessedAt < oldestQueuedAt;
+  }, [hasQueuedUnifiedTasks, queueItems, workerRunning, workerStatus?.worker?.idlePollCount, workerStatus?.worker?.lastProcessedAt]);
+  const desktopAutoRunnerActive = (!workerRunning || !workerCanProcessQueuedTypes || workerStalledOnCurrentQueue) && !hasCurrentInlineClaim;
+  const autoRunnerLabel = !workerRunning
+    ? "desktop fallback"
+    : !workerCanProcessQueuedTypes
+      ? "desktop fallback (worker filter mismatch)"
+      : workerStalledOnCurrentQueue
+        ? "desktop assist (worker idle)"
+        : "dedicated worker";
 
   const retryableReviewQueueJobs = useMemo(() => {
     return reviewQueueJobs.filter((job) => Boolean(job.matchResults?.[0]?.id));
@@ -895,7 +970,7 @@ export function PipelinePage() {
       if (!historyRes.ok) throw new Error(await readError(historyRes));
       const openPayload = (await openRes.json()) as { items: UnifiedTaskRow[] };
       const historyPayload = (await historyRes.json()) as { items: UnifiedTaskRow[] };
-      setQueueItems(openPayload.items || []);
+      setQueueItems(sortOpenUnifiedTasks(openPayload.items || []));
       setTaskHistoryItems(historyPayload.items || []);
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to load task queue");
@@ -1480,6 +1555,31 @@ export function PipelinePage() {
     }
   };
 
+  const saveJobResumeFormat = async (jobId: string, resumeFormatId: FormatId) => {
+    try {
+      setJobBusy(jobId, "Saving resume style…");
+      const res = await fetch("/api/jobs/" + jobId, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resume_format_id: resumeFormatId }),
+      });
+      if (!res.ok) throw new Error(await readError(res));
+      const payload = (await res.json()) as { item?: JobRecord };
+      const nextJob = payload.item;
+      if (!nextJob) throw new Error("Missing job payload");
+      const snapshotId = nextJob.published_snapshot_id || nextJob.latestTailorTask?.tailored_snapshot_id || null;
+      const artifacts = snapshotId ? await loadArtifactsForSnapshot(snapshotId) : undefined;
+      const merged = { ...nextJob, artifacts };
+      setJobs((previous) => mergeJobs(previous, [merged]));
+      setBatchJobs((previous) => mergeJobs(previous, [merged]));
+      await refreshQueue();
+    } catch (error) {
+      setIntakeError(error instanceof Error ? error.message : "Failed to save resume style");
+    } finally {
+      setJobBusy(jobId, null);
+    }
+  };
+
   const loadTaskContext = async (task: UnifiedTaskRow) => {
     try {
       setTaskDetailLoading((previous) => ({ ...previous, [task.id]: true }));
@@ -1577,7 +1677,9 @@ export function PipelinePage() {
   };
 
   const processNextQueueTask = async (): Promise<boolean> => {
+    if (processNextInFlightRef.current) return false;
     try {
+      processNextInFlightRef.current = true;
       setQueueLoading(true);
       const res = await fetch("/api/unified/tasks/process-next", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
       if (!res.ok) throw new Error(await readError(res));
@@ -1595,8 +1697,11 @@ export function PipelinePage() {
       return true;
     } catch (error) {
       setIntakeError(error instanceof Error ? error.message : "Failed to process next task");
+      await refreshQueue();
+      await refreshWorkerStatus();
       return false;
     } finally {
+      processNextInFlightRef.current = false;
       setQueueLoading(false);
     }
   };
@@ -1613,6 +1718,28 @@ export function PipelinePage() {
     void refreshWorkerStatus();
     void refreshInteractiveQueues();
   }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void refreshQueue();
+      void refreshWorkerStatus();
+    }, 5000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!desktopAutoRunnerActive) return;
+    if (!hasQueuedUnifiedTasks) return;
+    if (queueLoading) return;
+    const timeout = window.setTimeout(() => {
+      void processNextQueueTask();
+    }, 1200);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [desktopAutoRunnerActive, hasQueuedUnifiedTasks, queueLoading, queueItems.length]);
 
   useEffect(() => {
     if (activeBatchId) {
@@ -2039,6 +2166,7 @@ export function PipelinePage() {
                 <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-1">
                   <div className="text-xs uppercase tracking-wide text-muted-foreground">Worker</div>
                   <div><strong>ID:</strong> {workerStatus.worker.workerId || "—"}</div>
+                  <div><strong>Task types:</strong> {workerTaskTypes.length > 0 ? workerTaskTypes.join(", ") : "all"}</div>
                   <div><strong>Processed:</strong> {workerStatus.worker.processedCount ?? 0}</div>
                   <div><strong>Idle polls:</strong> {workerStatus.worker.idlePollCount ?? 0}</div>
                 </div>
@@ -2389,10 +2517,24 @@ export function PipelinePage() {
               </Button>
               <span className="text-sm text-muted-foreground">Open tasks: {queueItems.length}</span>
               <span className="text-sm text-muted-foreground">Processed history: {taskHistoryItems.length}</span>
+              <span className="text-sm text-muted-foreground">Desktop claimed: {currentInlineClaimCount}</span>
+              <span className="text-sm text-muted-foreground">
+                Auto runner: <strong>{autoRunnerLabel}</strong>
+              </span>
             </div>
             <p className="text-xs text-muted-foreground">
               With dedicated worker pools, ranking no longer needs to wait behind fetch or extract backlog. If you only run a single generic worker, tasks still advance one at a time through the shared queue.
             </p>
+            {desktopAutoRunnerActive && hasQueuedUnifiedTasks && (
+              <p className="text-xs text-muted-foreground">
+                Desktop runner assist is active because {!workerRunning ? "no connected worker is available" : !workerCanProcessQueuedTypes ? `the worker is filtered to ${workerTaskTypes.join(", ")} while queued tasks are ${queuedTaskTypes.join(", ")}` : "the connected worker has been idle against the current queued tasks"}.
+              </p>
+            )}
+            {hasCurrentInlineClaim && (
+              <p className="text-xs text-muted-foreground">
+                The desktop runner already has {currentInlineClaimCount} claimed task{currentInlineClaimCount === 1 ? "" : "s"} in progress, so it will not auto-claim more until those finish or fail.
+              </p>
+            )}
             {queueItems.length > 0 ? (
               <div className="rounded-md border">
                 <Table>
@@ -2929,16 +3071,35 @@ export function PipelinePage() {
                             {job.batchId && <span>Batch: <strong>{job.batchId}</strong></span>}
                             {job.work_model && <span>Work model: <strong>{job.work_model}</strong></span>}
                             {job.location && <span>Location: <strong>{job.location}</strong></span>}
+                            <span>Format: <strong>{coerceFormatId(job.resume_format_id)}</strong></span>
+                            {job.published_at && <span>Published: <strong>{new Date(job.published_at).toLocaleString()}</strong></span>}
                           </div>
                           {job.linkedApplication && (
                             <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                               <span>Application: <strong>{job.linkedApplication.id}</strong></span>
                               <span>Applied: <strong>{Number(job.linkedApplication.applied_manually) === 1 ? "yes" : "no"}</strong></span>
+                              <span>App format: <strong>{coerceFormatId(job.linkedApplication.resume_format_id)}</strong></span>
                               {job.linkedApplication.resume_file_name && <span>Resume file: <strong>{job.linkedApplication.resume_file_name}</strong></span>}
+                              {job.published_snapshot_id && <span>Published snapshot: <strong>{job.published_snapshot_id}</strong></span>}
                             </div>
                           )}
                         </div>
                         <div className="flex flex-wrap gap-2">
+                          <select
+                            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                            value={coerceFormatId(job.resume_format_id)}
+                            onChange={(event: React.ChangeEvent<HTMLSelectElement>) => {
+                              void saveJobResumeFormat(job.id, event.target.value as FormatId);
+                            }}
+                            disabled={Boolean(busyLabel)}
+                            aria-label="Resume style"
+                          >
+                            {FORMAT_LIST.map((format) => (
+                              <option key={format.formatId} value={format.formatId}>
+                                {format.name}
+                              </option>
+                            ))}
+                          </select>
                           <Button type="button" variant="outline" onClick={() => void refreshJob(job.id)} disabled={Boolean(busyLabel)}>
                             {busyLabel === "Refreshing…" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
                             Refresh

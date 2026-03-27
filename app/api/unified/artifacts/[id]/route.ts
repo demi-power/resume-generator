@@ -21,7 +21,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   const mimeType = String(artifact.mime_type || "application/octet-stream");
   const fileName = path.basename(String(artifact.relative_path || "artifact"));
 
-  return new NextResponse(record.contents, {
+  return new NextResponse(new Uint8Array(record.contents), {
     headers: {
       "content-type": mimeType,
       "content-length": String(record.contents.byteLength),

@@ -171,12 +171,19 @@ export function enqueueUnifiedTask(params: {
 
 export function recoverExpiredUnifiedTasks(taskTypes?: UnifiedTaskType[]): number {
   const now = nowIso();
+  const staleCutoff = new Date(Date.now() - DEFAULT_LEASE_MS).toISOString();
   const typeFilter = taskTypes && taskTypes.length > 0 ? ` AND task_type IN (${taskTypes.map(() => "?").join(", ")})` : "";
   const result = rawDb
     .prepare(
-      `UPDATE unified_tasks SET status = 'queued', worker_id = NULL, updated_at = ?, started_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL WHERE status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?${typeFilter}`
+      `UPDATE unified_tasks
+         SET status = 'queued', worker_id = NULL, updated_at = ?, started_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
+       WHERE status = 'claimed'
+         AND (
+           (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+           OR (lease_expires_at IS NULL AND COALESCE(heartbeat_at, '') = '' AND updated_at <= ?)
+         )${typeFilter}`
     )
-    .run(now, now, ...(taskTypes ?? []));
+    .run(now, now, staleCutoff, ...(taskTypes ?? []));
   return result.changes;
 }
 
@@ -234,8 +241,11 @@ export function failUnifiedTask(taskId: string, error: Record<string, unknown>):
   return getUnifiedTask(taskId)!;
 }
 
-async function executeClaimedUnifiedTask(task: UnifiedTaskRow): Promise<Record<string, unknown>> {
-  const payload = safeJsonParse(task.payload_json, {} as Record<string, unknown>);
+async function executeClaimedUnifiedTask(task: UnifiedTaskRow, extraPayload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const payload = {
+    ...safeJsonParse(task.payload_json, {} as Record<string, unknown>),
+    ...extraPayload,
+  };
   const store = await import("@/lib/unified/store");
   switch (task.task_type) {
     case "job_fetch":
@@ -262,6 +272,7 @@ export async function processNextUnifiedTask(params: {
   workerId?: string;
   taskTypes?: UnifiedTaskType[];
   leaseMs?: number;
+  payload?: Record<string, unknown>;
 } = {}): Promise<{ task: UnifiedTaskRow; result: Record<string, unknown> } | null> {
   const claimed = claimUnifiedTasks({
     workerId: params.workerId ?? "inline-runner",
@@ -272,7 +283,7 @@ export async function processNextUnifiedTask(params: {
   if (claimed.length === 0) return null;
   const task = claimed[0];
   try {
-    const result = await executeClaimedUnifiedTask(task);
+    const result = await executeClaimedUnifiedTask(task, params.payload);
     return { task: completeUnifiedTask(task.id, result), result };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

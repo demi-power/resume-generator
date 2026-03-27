@@ -18,6 +18,14 @@ function isStrictMode(): boolean {
   return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
+function getWorkerTimeoutMs(): number {
+  const explicit = Number.parseInt(process.env.UNIFIED_AI_WORKER_TIMEOUT_MS || "", 10);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const ollamaSeconds = Number.parseInt(process.env.OLLAMA_TIMEOUT_SECONDS || "", 10);
+  if (Number.isFinite(ollamaSeconds) && ollamaSeconds > 0) return ollamaSeconds * 1000 + 15_000;
+  return 135_000;
+}
+
 async function postWorkerJson<T>(path: string, body: unknown): Promise<T | null> {
   const baseUrl = getWorkerBaseUrl();
   if (!baseUrl) return null;
@@ -31,11 +39,17 @@ async function postWorkerJson<T>(path: string, body: unknown): Promise<T | null>
   }
 
   try {
+    const controller = new AbortController();
+    const timeoutMs = getWorkerTimeoutMs();
+    const timeoutId = setTimeout(() => controller.abort(new Error(`Unified AI worker request timed out after ${timeoutMs}ms`)), timeoutMs);
     const response = await fetch(baseUrl + path, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       cache: "no-store",
+      signal: controller.signal,
+    }).finally(() => {
+      clearTimeout(timeoutId);
     });
     const text = await response.text();
     if (!response.ok) {
